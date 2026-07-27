@@ -1,0 +1,36 @@
+// onProvision (control-plane, abort-on-failure) for yasdb.
+//
+// Composes this instance's SlateDB object-store wiring so that many yasdb
+// instances can share ONE Tigris bucket, each isolated under its own database
+// prefix derived from the Fly app name. Returned `env` is merged into the
+// machine environment; the yasdb entrypoint turns it into `-store`/`-db` flags.
+//
+// What this hook does NOT do: create the Tigris bucket or its credentials.
+// provisor's control-plane capabilities are `http.get` (allowlisted, GET-only),
+// `secret.generate`, and `fly.*` (machines/IPs) — none can call Fly's/Tigris'
+// provisioning API. Create the bucket out-of-band (docs/DEPLOY.md §6a) and pass
+// the shared Tigris key/secret as the service's *secrets*; this hook only wires
+// the non-secret, per-instance parts.
+//
+// Injected globals: event {app, region, flycast_ip}, log
+// Grants required:  none
+// Result contract:  { "env": { ...machine env... } }
+
+let bucket = "CHANGE-ME-yasdb"   // your shared Tigris bucket name
+let endpoint = "https://fly.storage.tigris.dev"
+let app = event["app"]
+
+// Each instance gets its own DB prefix within the shared bucket, so instances
+// never collide and one bucket serves the whole fleet.
+let dbPrefix = "yasdb/" + app
+
+log.info("yasdb object store", "store=s3://" + bucket + " db=" + dbPrefix)
+
+{
+    "env": {
+        "YASDB_STORE":  "s3://" + bucket,
+        "YASDB_DB":     dbPrefix,
+        "AWS_ENDPOINT": endpoint,
+        "AWS_REGION":   "auto",
+    },
+}

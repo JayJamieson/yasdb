@@ -7,6 +7,16 @@
 *.dll
 *.so
 *.dylib
+# ...but the bundled SlateDB native library is tracked
+!lib/libslatedb_uniffi.so
+
+# Local data directory created by the server
+/yasdb-data/
+
+# Maelstrom test store (results/logs) and stray built binaries
+/store/
+/maelstrom-adapter
+/yasdb
 
 # Test binary, built with `go test -c`
 *.test

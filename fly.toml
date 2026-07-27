@@ -1,0 +1,54 @@
+# fly.toml — direct `fly deploy` of yasdb (the non-provisor path).
+#
+# provisor drives the Fly API directly and does NOT read this file; it's for
+# `fly launch` / `fly deploy`, and doubles as documentation of the machine shape
+# provisor replicates (port 4437, /__health probe, a single machine, a data
+# volume). See docs/DEPLOY.md.
+
+app = "yasdb"
+primary_region = "syd"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "4437"
+  YASDB_FLUSH = "10ms"
+
+  # --- Object-store (Tigris) mode ---
+  # Create the bucket + credentials first (docs/DEPLOY.md §6):
+  #   fly storage create --name <bucket> --app yasdb
+  # That sets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as Fly *secrets* (never
+  # put those here). Then set the non-secret store wiring:
+  YASDB_STORE = "s3://<bucket>"   # bucket only — the DB prefix goes in YASDB_DB
+  YASDB_DB = "yasdb"
+  AWS_ENDPOINT = "https://fly.storage.tigris.dev"
+  AWS_REGION = "auto"
+
+  # --- Local-volume mode alternative ---
+  # Omit YASDB_STORE and the AWS_* lines above, uncomment [mounts] below, and
+  # data lands at /data/yasdb (YASDB_DATA default).
+
+[http_service]
+  internal_port = 4437
+  force_https = true
+  # Single writer: keep exactly one machine running; do not autoscale.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/__health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"   # SlateDB + Tokio; 256mb is too tight
+
+# Uncomment for local-volume mode (see above):
+# [mounts]
+#   source = "yasdb_data"
+#   destination = "/data"
