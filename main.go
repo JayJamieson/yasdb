@@ -1,45 +1,95 @@
+// Command yasdb runs a Durable Streams server backed by SlateDB.
 package main
 
 import (
-    "io"
-    "slatedb.io/slatedb-go"
+	"context"
+	"flag"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/JayJamieson/yasdb/internal/ds"
 )
 
-// In memory object storage (development)
-db, _ := slatedb.Open("/tmp/cache")
-defer db.Close()
+func main() {
+	addr := flag.String("addr", ":4437", "listen address")
+	storeURL := flag.String("store", "", "object store URL (e.g. memory:///, s3://bucket/prefix); defaults to a local file store under -data")
+	dataDir := flag.String("data", "./yasdb-data", "local data directory used when -store is empty")
+	dbPath := flag.String("db", "yasdb", "database path/prefix within the object store")
+	flush := flag.Duration("flush", 10*time.Millisecond, "SlateDB WAL flush interval (durable-append latency floor); 0 = engine default (100ms)")
+	durability := flag.String("durability", "sync", "append durability model: sync (block each write on durability) or notifier (non-blocking write + durable-seq watcher; pipelines appends)")
+	pollInterval := flag.Duration("notifier-poll", time.Millisecond, "durable-seq poll cadence in -durability notifier mode")
+	liveCoalesce := flag.Duration("live-coalesce", 0, "coalesce live-reader (SSE/long-poll) wakeups within this window to tame fan-out under high commit-rate × many readers; 0 = wake on every commit")
+	noLiveCache := flag.Bool("no-live-cache", false, "disable the in-memory recent-records cache that lets caught-up live readers avoid a store scan (escape hatch; correctness is unchanged)")
+	longPollTimeout := flag.Duration("longpoll-timeout", 0, "how long a live=long-poll read blocks waiting for data before returning 204; 0 = default (25s)")
+	liveCacheBytes := flag.Int("live-cache-bytes", 0, "per-stream cap on the in-memory recent-records cache (bytes); 0 = default (256 KiB). Lower to cut memory on many-hot-stream deployments")
+	flag.Parse()
 
-// S3 (production)
-db, _ := slatedb.Open("/tmp/cache", slatedb.WithUrl[slatedb.DbConfig]("s3://bucket/"))
-defer db.Close()
+	url, dbp, err := ds.ResolveStore(*storeURL, *dataDir, *dbPath)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
-// Environment variables (automatic fallback)
-db, _ := slatedb.Open("/tmp/cache", slatedb.WithEnvFile[slatedb.DbConfig]("/path/to/env"))
-defer db.Close()
+	store, err := ds.OpenStore(dbp, url, *flush)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	srv, err := ds.NewServer(store, ds.Config{
+		Durability:           *durability,
+		NotifierPollInterval: *pollInterval,
+		LiveCoalesceWindow:   *liveCoalesce,
+		DisableLiveCache:     *noLiveCache,
+		LongPollTimeout:      *longPollTimeout,
+		LiveCacheMaxBytes:    *liveCacheBytes,
+	})
+	if err != nil {
+		log.Fatalf("start server: %v", err)
+	}
 
-// Basic operations
-db.Put([]byte("key"), []byte("value"))
-value, _ := db.Get([]byte("key"))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Liveness/readiness probe (e.g. provisor --health-path /__health). Kept
+		// out of the stream keyspace so it never collides with a stream path.
+		if r.URL.Path == "/__health" {
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				w.Write([]byte("ok\n"))
+			}
+			return
+		}
+		if r.URL.Path == "/__ui" || strings.HasPrefix(r.URL.Path, "/__ui/") {
+			serveUI(w, r)
+			return
+		}
+		srv.ServeHTTP(w, r)
+	})
 
-// Range scanning with iterator
-iter, _ := db.Scan([]byte("prefix:"), []byte("prefix;"))
-defer iter.Close()
-for {
-    kv, err := iter.Next()
-    if err == io.EOF { break }
-    // Process kv.Key and kv.Value
-}
+	httpSrv := &http.Server{Addr: *addr, Handler: handler}
 
-// Scanning with custom options
-opts := &slatedb.ScanOptions{
-    DurabilityFilter: slatedb.DurabilityRemote, // Only persistent data
-    ReadAheadBytes:   1024,
-    MaxFetchTasks:    4, // Higher concurrency
-}
-iter, _ := db.ScanWithOptions([]byte("prefix:"), []byte("prefix;"), opts)
-defer iter.Close()
-for {
-    kv, err := iter.Next()
-    if err == io.EOF { break }
-    // Process kv.Key and kv.Value
+	uiHost := *addr
+	if strings.HasPrefix(uiHost, ":") {
+		uiHost = "localhost" + uiHost
+	}
+	go func() {
+		log.Printf("yasdb listening on %s (store=%s, durability=%s, ui=http://%s/__ui/)", *addr, url, *durability, uiHost)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Println("shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = httpSrv.Shutdown(ctx)
+	if err := srv.Close(); err != nil {
+		log.Printf("close: %v", err)
+	}
 }

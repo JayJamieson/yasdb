@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>yasdb — Durable Streams playground</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171d2b; --panel2: #1e2637; --line: #2b3550;
+    --fg: #e6ebf5; --muted: #8a97b3; --accent: #5b8cff; --accent2: #38d39f;
+    --warn: #ffb454; --err: #ff6b7a; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 12px; background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  header code { color: var(--accent2); font-family: var(--mono); }
+  .wrap { display: grid; grid-template-columns: 420px 1fr; gap: 0; height: calc(100vh - 51px); }
+  .controls { overflow-y: auto; padding: 16px; border-right: 1px solid var(--line); }
+  .output { display: flex; flex-direction: column; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); margin: 0 0 10px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+    border-radius: 7px; padding: 7px 9px; font-family: var(--mono); font-size: 13px; }
+  textarea { resize: vertical; min-height: 60px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .checks { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; align-items: center; }
+  .checks label { display: flex; align-items: center; gap: 5px; margin: 0; color: var(--fg); }
+  .checks input { width: auto; }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
+  button.good { background: var(--accent2); color: #05261c; }
+  button.danger { background: var(--err); }
+  button.warn { background: var(--warn); color: #3a2400; }
+  .out-head { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel); }
+  .out-head h2 { font-size: 13px; margin: 0; }
+  .out-head .spacer { flex: 1; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 16px; font-family: var(--mono);
+    font-size: 12.5px; }
+  .entry { border-left: 3px solid var(--line); padding: 6px 10px; margin-bottom: 10px;
+    background: var(--panel); border-radius: 0 8px 8px 0; }
+  .entry .meta { color: var(--muted); font-size: 11.5px; margin-bottom: 4px; }
+  .entry .status { font-weight: 700; }
+  .s2 { color: var(--accent2); } .s3 { color: var(--accent); }
+  .s4 { color: var(--warn); } .s5 { color: var(--err); }
+  .entry pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--fg); }
+  .hdrs { color: var(--muted); font-size: 11.5px; }
+  .hdrs b { color: var(--accent2); font-weight: 600; }
+  .sse .meta { color: var(--accent); }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 20px; background: var(--panel2);
+    border: 1px solid var(--line); color: var(--muted); }
+  .pill.live { color: var(--accent2); border-color: var(--accent2); }
+  .hint { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>yasdb</h1>
+  <span class="tag">Durable Streams playground · base <code id="base"></code></span>
+</header>
+<div class="wrap">
+  <div class="controls">
+    <div class="card">
+      <h2>Stream</h2>
+      <label>Path</label>
+      <input type="text" id="path" value="/demo/stream" />
+      <label>Content-Type</label>
+      <select id="ctype">
+        <option>application/json</option>
+        <option>text/plain</option>
+        <option>application/octet-stream</option>
+      </select>
+    </div>
+
+    <div class="card">
+      <h2>Create (PUT)</h2>
+      <label>Stream-TTL (seconds, optional)</label>
+      <input type="text" id="ttl" placeholder="e.g. 3600" />
+      <div class="checks"><label><input type="checkbox" id="createClosed" /> Stream-Closed</label></div>
+      <label>Initial body (optional)</label>
+      <textarea id="createBody" placeholder='e.g. [{"hello":"world"}]'></textarea>
+      <div class="btns">
+        <button class="good" onclick="doPut()">PUT create</button>
+        <button class="ghost" onclick="doHead()">HEAD</button>
+        <button class="danger" onclick="doDelete()">DELETE</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Append (POST)</h2>
+      <label>Body</label>
+      <textarea id="appendBody" placeholder='{"event":"click"} or ["a","b"] for JSON'>{"event":"click","ts":1}</textarea>
+      <div class="checks"><label><input type="checkbox" id="appendClosed" /> Stream-Closed (close after append)</label></div>
+      <label>Stream-Seq (optional)</label>
+      <input type="text" id="streamSeq" placeholder="lexicographic, e.g. 0001" />
+      <div class="row">
+        <div><label>Producer-Id</label><input type="text" id="pid" placeholder="optional" /></div>
+        <div><label>Epoch</label><input type="number" id="pepoch" placeholder="0" min="0" /></div>
+        <div><label>Seq</label><input type="number" id="pseq" placeholder="0" min="0" /></div>
+      </div>
+      <div class="btns">
+        <button onclick="doPost()">POST append</button>
+        <button class="warn" onclick="doClose()">Close only</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Read</h2>
+      <label>Offset</label>
+      <input type="text" id="offset" value="-1" />
+      <div class="hint">Use <code>-1</code> (start), <code>now</code> (tail), or a token from Stream-Next-Offset.</div>
+      <div class="btns">
+        <button onclick="doGet()">GET catch-up</button>
+        <button class="ghost" onclick="doLongPoll()">Long-poll</button>
+        <button class="ghost" onclick="useNextOffset()">Use next offset →</button>
+      </div>
+      <div class="btns">
+        <button class="good" id="sseBtn" onclick="toggleSSE()">▶ Live tail (SSE)</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="output">
+    <div class="out-head">
+      <h2>Activity</h2>
+      <span id="ssePill" class="pill">SSE idle</span>
+      <span id="nextPill" class="pill">next: —</span>
+      <div class="spacer"></div>
+      <button class="ghost" onclick="clearLog()">clear</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const base = window.location.origin;
+document.getElementById('base').textContent = base;
+let lastNext = null;
+let es = null;
+
+const $ = id => document.getElementById(id);
+const streamURL = () => base + $('path').value;
+
+function statusClass(s){ return 's' + String(s)[0]; }
+
+function log(kind, title, meta, headers, body){
+  const el = document.createElement('div');
+  el.className = 'entry' + (kind === 'sse' ? ' sse' : '');
+  let h = '';
+  if (headers) {
+    const keys = ['Stream-Next-Offset','Stream-Closed','Stream-Up-To-Date','Stream-Cursor','ETag','Content-Type','Cache-Control','Stream-TTL','Stream-Expires-At','Producer-Epoch','Producer-Seq','Producer-Expected-Seq','Producer-Received-Seq','Location'];
+    const parts = [];
+    for (const k of keys){ const v = headers.get(k); if (v) parts.push('<b>'+k+'</b>: '+escapeHtml(v)); }
+    if (parts.length) h = '<div class="hdrs">'+parts.join('<br>')+'</div>';
+  }
+  el.innerHTML = '<div class="meta">'+escapeHtml(meta)+'</div>'
+    + '<div><span class="'+(title.cls||'')+'">'+escapeHtml(title.text)+'</span></div>'
+    + h + (body ? '<pre>'+escapeHtml(body)+'</pre>' : '');
+  const logEl = $('log');
+  logEl.prepend(el);
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function clearLog(){ $('log').innerHTML=''; }
+
+function rememberNext(headers){
+  const n = headers.get('Stream-Next-Offset');
+  if (n){ lastNext = n; $('nextPill').textContent = 'next: '+n; }
+}
+function useNextOffset(){ if (lastNext){ $('offset').value = lastNext; } }
+
+async function send(method, url, opts={}){
+  const started = new Date().toLocaleTimeString();
+  try {
+    const resp = await fetch(url, { method, ...opts });
+    const body = method === 'HEAD' ? '' : await resp.text();
+    rememberNext(resp.headers);
+    log('http',
+      { text: method + ' → ' + resp.status + ' ' + resp.statusText, cls: 'status ' + statusClass(resp.status) },
+      started + '  ' + method + ' ' + url.replace(base,''),
+      resp.headers, body);
+    return resp;
+  } catch (e){
+    log('http', { text: method + ' → network error', cls: 'status s5' }, started + '  ' + url.replace(base,''), null, String(e));
+  }
+}
+
+function headers(extra){
+  const h = {};
+  const ct = $('ctype').value;
+  if (extra?.ct !== false) h['Content-Type'] = ct;
+  return Object.assign(h, extra?.h || {});
+}
+
+function doPut(){
+  const h = {};
+  const ct = $('ctype').value; if (ct) h['Content-Type'] = ct;
+  if ($('ttl').value.trim()) h['Stream-TTL'] = $('ttl').value.trim();
+  if ($('createClosed').checked) h['Stream-Closed'] = 'true';
+  const body = $('createBody').value;
+  send('PUT', streamURL(), { headers: h, body: body || undefined });
+}
+
+function producerHeaders(h){
+  const pid = $('pid').value.trim();
+  if (pid){ h['Producer-Id']=pid; h['Producer-Epoch']=$('pepoch').value||'0'; h['Producer-Seq']=$('pseq').value||'0'; }
+  return h;
+}
+
+function doPost(){
+  const h = producerHeaders({ 'Content-Type': $('ctype').value });
+  if ($('appendClosed').checked) h['Stream-Closed']='true';
+  if ($('streamSeq').value.trim()) h['Stream-Seq']=$('streamSeq').value.trim();
+  send('POST', streamURL(), { headers: h, body: $('appendBody').value });
+}
+
+function doClose(){
+  const h = producerHeaders({ 'Stream-Closed':'true' });
+  send('POST', streamURL(), { headers: h });
+}
+
+function doHead(){ send('HEAD', streamURL()); }
+function doDelete(){ send('DELETE', streamURL()); }
+
+function doGet(){
+  const off = encodeURIComponent($('offset').value.trim() || '-1');
+  send('GET', streamURL() + '?offset=' + off);
+}
+function doLongPoll(){
+  const off = encodeURIComponent($('offset').value.trim() || '-1');
+  send('GET', streamURL() + '?offset=' + off + '&live=long-poll');
+}
+
+function toggleSSE(){
+  if (es){ stopSSE(); return; }
+  const off = encodeURIComponent($('offset').value.trim() || '-1');
+  const url = streamURL() + '?offset=' + off + '&live=sse';
+  es = new EventSource(url);
+  $('sseBtn').textContent = '■ Stop live tail';
+  $('sseBtn').classList.add('danger'); $('sseBtn').classList.remove('good');
+  $('ssePill').textContent = 'SSE live'; $('ssePill').classList.add('live');
+  log('sse', { text: 'SSE opened', cls: 's3' }, new Date().toLocaleTimeString() + '  ' + url.replace(base,''), null, null);
+  es.addEventListener('data', e => {
+    log('sse', { text: 'event: data', cls: 's2' }, new Date().toLocaleTimeString(), null, e.data);
+  });
+  es.addEventListener('control', e => {
+    let closed = false;
+    try { const c = JSON.parse(e.data); if (c.streamNextOffset){ lastNext = c.streamNextOffset; $('nextPill').textContent='next: '+c.streamNextOffset; } closed = !!c.streamClosed; } catch(_){}
+    log('sse', { text: 'event: control', cls: 's3' }, new Date().toLocaleTimeString(), null, e.data);
+    if (closed){ log('sse', { text: 'stream closed — EOF', cls: 's4' }, new Date().toLocaleTimeString(), null, null); stopSSE(); }
+  });
+  es.onerror = () => {
+    // EventSource auto-reconnects; for a closed/one-shot stream we stop.
+    log('sse', { text: 'SSE connection closed/reconnecting', cls: 's4' }, new Date().toLocaleTimeString(), null, null);
+  };
+}
+function stopSSE(){
+  if (es){ es.close(); es = null; }
+  $('sseBtn').textContent = '▶ Live tail (SSE)';
+  $('sseBtn').classList.remove('danger'); $('sseBtn').classList.add('good');
+  $('ssePill').textContent = 'SSE idle'; $('ssePill').classList.remove('live');
+}
+</script>
+</body>
+</html>
