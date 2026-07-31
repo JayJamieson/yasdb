@@ -18,6 +18,13 @@
 /maelstrom-adapter
 /yasdb
 
+# k6 load-test run artifacts (summaries + metric dumps)
+/k6/results/
+
+# Ad-hoc metric exports dropped in the repo root (Grafana/k6 downloads)
+/result*.json
+/results*.zip
+
 # Test binary, built with `go test -c`
 *.test
 

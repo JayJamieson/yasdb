@@ -34,7 +34,13 @@ durability modes (`-durability`, injected as a `committer` strategy — see
   blocking on the flush. A stream does not retire while durability callbacks are
   outstanding, so a respawn can never read a stale tail. This scales single-stream
   concurrent throughput with concurrency rather than plateauing at `maxBurst /
-  flush` (see `BENCHMARKS.md`).
+  flush` (see `BENCHMARKS.md`). Reader-tail publication is strictly ordered —
+  every durability callback fires on the single watcher goroutine, never inline on
+  the writer — so an acked offset is always immediately readable
+  (read-after-acknowledge holds). An earlier ordering bug here, where an
+  already-durable ack could fire on the writer goroutine and race the watcher,
+  momentarily regressing the reader-visible tail, is fixed and guarded by
+  `TestProbeReadAfterAck`.
 
 Both modes pass the full suite under `-race` and the Maelstrom kafka
 log-consistency and crash-injection checks.
@@ -121,6 +127,13 @@ per-key TTL, so expiry logic stays in one place (`expiry.go`).
 - **`TestReadHeavyStress`** — 60 concurrent readers (catch-up + long-poll + SSE)
   byte-checking a dense self-describing log against one writer, through the
   coalesced wake path, so any reorder / gap / duplicate / torn read fails.
+- **Linearizability (Porcupine)** — `internal/ds/porcupine*_test.go` model each
+  stream as an append-only log and check concurrent histories against the real
+  server: a plain-append model, an idempotent-producer model (epoch fencing +
+  exactly-once seq dedup), and a fault-injection variant (a reverse proxy severs
+  connections mid-append; clients retry the same producer/epoch/seq). Each carries
+  a negative-control test proving the model rejects real violations, and
+  `TestProbeReadAfterAck` asserts read-after-acknowledge in both durability modes.
 - **Record-cache differential guard** — `TestLiveCacheMatchesStore` and
   `FuzzLiveCacheMatchesStore` assert the cache path is byte-identical to a store
   scan across every offset (the two paths are oracles for each other). The SSE

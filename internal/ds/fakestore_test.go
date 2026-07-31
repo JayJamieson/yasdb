@@ -8,7 +8,7 @@ import (
 )
 
 // fakeStore is an in-memory Storage used by the functional tests: a second
-// implementation of the persistence vertical that needs no cgo / SlateDB and behaves
+// implementation of the persistence seam that needs no cgo / SlateDB and behaves
 // deterministically. Keys sort byte-wise (matching SlateDB, which the big-endian
 // key encoding relies on), Commit is atomic, and writes are durable the instant
 // they land — so CommitAsync assigns a monotonic seq that DurableSeq immediately
