@@ -20,7 +20,7 @@ The `Makefile` wires up the cgo linker/loader flags for the bundled library:
 
 ```bash
 make build
-make run ARGS="-addr :4437 -data ./yasdb-data"
+make run ARGS="-addr :4437 -data ./yasdb-data -durability notifier -live-cache-bytes 256"
 ```
 
 ## Flags

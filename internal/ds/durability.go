@@ -49,16 +49,18 @@ func newDurabilityNotifier(store Storage, interval time.Duration) *durabilityNot
 
 // subscribe invokes cb exactly once: with nil when the durable watermark reaches
 // target, or with an error if the store is (or becomes) closed.
+//
+// The callback always fires from the single poller goroutine (poll -> fire),
+// never synchronously here — even when target is already durable. That keeps
+// callbacks totally ordered by target, which the notifier committer relies on:
+// applyReader publishes the reader-visible tail per burst, and firing an
+// already-durable subscribe on the caller's goroutine could race the poller
+// firing an earlier burst, regressing the tail and breaking read-after-ack.
 func (n *durabilityNotifier) subscribe(target uint64, cb func(error)) {
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
 		cb(errStoreClosed)
-		return
-	}
-	if target <= n.lastDurable {
-		n.mu.Unlock()
-		cb(nil)
 		return
 	}
 	i := sort.Search(len(n.waiters), func(i int) bool { return n.waiters[i].target > target })

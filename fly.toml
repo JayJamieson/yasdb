@@ -1,54 +1,45 @@
-# fly.toml — direct `fly deploy` of yasdb (the non-provisor path).
+# fly.toml app configuration file generated for yasdb on 2026-07-31T09:57:15+12:00
 #
-# provisor drives the Fly API directly and does NOT read this file; it's for
-# `fly launch` / `fly deploy`, and doubles as documentation of the machine shape
-# provisor replicates (port 4437, /__health probe, a single machine, a data
-# volume). See docs/DEPLOY.md.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "yasdb"
-primary_region = "syd"
+app = 'yasdb'
+primary_region = 'syd'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "4437"
-  YASDB_FLUSH = "10ms"
+  PORT = '4437'
+  YASDB_DATA = '/data/yasdb'
+  YASDB_DURABILITY = 'notifier'
+  YASDB_FLUSH = '2ms'
 
-  # --- Object-store (Tigris) mode ---
-  # Create the bucket + credentials first (docs/DEPLOY.md §6):
-  #   fly storage create --name <bucket> --app yasdb
-  # That sets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as Fly *secrets* (never
-  # put those here). Then set the non-secret store wiring:
-  YASDB_STORE = "s3://<bucket>"   # bucket only — the DB prefix goes in YASDB_DB
-  YASDB_DB = "yasdb"
-  AWS_ENDPOINT = "https://fly.storage.tigris.dev"
-  AWS_REGION = "auto"
-
-  # --- Local-volume mode alternative ---
-  # Omit YASDB_STORE and the AWS_* lines above, uncomment [mounts] below, and
-  # data lands at /data/yasdb (YASDB_DATA default).
+[[mounts]]
+  source = 'yasdb_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 4437
   force_https = true
-  # Single writer: keep exactly one machine running; do not autoscale.
-  auto_stop_machines = "off"
-  auto_start_machines = false
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/__health"
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/__health'
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 2000
+    hard_limit = 2500
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"   # SlateDB + Tokio; 256mb is too tight
-
-# Uncomment for local-volume mode (see above):
-# [mounts]
-#   source = "yasdb_data"
-#   destination = "/data"
+  cpu_kind = "performance"
+  memory = '4gb'
+  cpus = 2
+  memory_mb = 4096

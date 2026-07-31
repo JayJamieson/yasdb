@@ -14,9 +14,10 @@ done
 
 ADDR=":${PORT:-4437}"
 FLUSH="${YASDB_FLUSH:-10ms}"
+DURABILITY="${YASDB_DURABILITY:-notifier}"
 
 if [ -n "${YASDB_STORE:-}" ]; then
-    exec yasdb -addr "$ADDR" -store "$YASDB_STORE" -db "${YASDB_DB:-yasdb}" -flush "$FLUSH"
+    exec yasdb -addr "$ADDR" -store "$YASDB_STORE" -db "${YASDB_DB:-yasdb}" -durability "$DURABILITY" -live-cache-bytes 256 -flush "$FLUSH"
 else
-    exec yasdb -addr "$ADDR" -data "${YASDB_DATA:-/data/yasdb}" -flush "$FLUSH"
+    exec yasdb -addr "$ADDR" -data "${YASDB_DATA:-/data/yasdb}" -durability "$DURABILITY" -live-cache-bytes 256 -flush "$FLUSH"
 fi
