@@ -12,13 +12,14 @@ import (
 	"time"
 )
 
-// Read-heavy stress: one writer appends a dense, self-describing log (record i
-// has body "%08d" of i) while many concurrent readers hammer every read path —
-// catch-up, long-poll, and SSE. Because each record's content encodes its own
-// position, any reordering, gap, duplication, phantom, or torn record is caught
-// by a byte-level content check, and the tail can only ever grow. This stresses
-// the read side (broadcast fan-out to dozens of waiters, per-record iterator
-// FFI, offset assembly) that the write-side benchmarks don't.
+// Read-heavy stress: one writer appends a dense, self-describing log
+// (record i has body "%08d" of i) while many concurrent readers hammer
+// every read path: catch-up, long-poll, and SSE. Because each record's
+// content encodes its own position, any reordering, gap, duplication,
+// phantom, or torn record is caught by a byte-level content check, and the
+// tail can only ever grow. This stresses the read side (broadcast fan-out
+// to dozens of waiters, per-record iterator FFI, offset assembly) that the
+// write-side benchmarks do not.
 //
 // Runs in both durability modes (YASDB_TEST_DURABILITY). Skipped under -short.
 func TestReadHeavyStress(t *testing.T) {

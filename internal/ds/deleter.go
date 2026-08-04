@@ -15,7 +15,7 @@ func isShutdownErr(err error) bool {
 const deleteChunk = 1000
 
 // resumeDeletions restarts any deletions that were interrupted by a crash. The
-// DeletePending index makes deletion resumable rather than restartable (SPEC §10).
+// DeletePending index makes deletion resumable rather than restartable.
 func (s *Server) resumeDeletions() {
 	it, err := s.store.Scan([]byte{byte(ktDeletePending)}, prefixEnd([]byte{byte(ktDeletePending)}))
 	if err != nil {

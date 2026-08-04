@@ -107,7 +107,7 @@ func benchFanout(b *testing.B, readers, writers int, window time.Duration, disab
 				if i >= int64(b.N) {
 					return
 				}
-				srv.submitAppend(path, appendReq{records: [][]byte{[]byte(rec(int(i)))}, hasBody: true, contentType: "text/plain"})
+				srv.submitAppend(path, appendReq{records: [][]byte{[]byte(rec(int(i)))}, hasBody: true, contentType: "text/plain"}, nil)
 			}
 		}()
 	}

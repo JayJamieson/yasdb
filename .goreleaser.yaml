@@ -1,0 +1,59 @@
+version: 2
+
+project_name: yasdb
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: yasdb
+    main: .
+    binary: yasdb
+    goos: [linux]
+    goarch: [amd64]
+    # yasdb links the bundled SlateDB native library (lib/libslatedb_uniffi.so)
+    # via cgo. $ORIGIN/lib (a literal ld.so token, not a shell variable — do
+    # not quote/escape it away) makes the binary self-locating: it resolves
+    # the .so relative to wherever the binary itself ends up, so the release
+    # archive works when extracted to any directory, as long as lib/ stays
+    # next to the binary (see the archives section below).
+    env:
+      - CGO_ENABLED=1
+      - CGO_LDFLAGS=-L./lib -Wl,-rpath,$ORIGIN/lib
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }} -X main.date={{ .Date }}
+
+archives:
+  - id: yasdb
+    files:
+      - src: lib/libslatedb_uniffi.so
+        dst: lib/
+      - README.md
+      - LICENSE
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  footer: |
+    ## Docker image
+
+    ```
+    docker pull jayjamieson/yasdb:{{ .Tag }}
+    ```
+
+    See [`docs/DEPLOY.md`](https://github.com/JayJamieson/yasdb/blob/{{ .Tag }}/docs/DEPLOY.md)
+    to deploy this release.

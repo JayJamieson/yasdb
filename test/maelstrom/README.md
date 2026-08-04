@@ -9,8 +9,8 @@ to yasdb HTTP —
 
 | kafka RPC                | yasdb                                                      |
 | ------------------------ | ---------------------------------------------------------- |
-| `send {key, msg}`        | `POST /mlst/<key>` (one JSON message) → offset = seq       |
-| `poll {offsets}`         | `GET /mlst/<key>?offset=<seq>` → `[[offset, msg], …]`      |
+| `send {key, msg}`        | `POST /mlst/<key>` (one JSON message) -> offset = seq       |
+| `poll {offsets}`         | `GET /mlst/<key>?offset=<seq>` -> `[[offset, msg], …]`      |
 | `commit_offsets` / `list_committed_offsets` | in-process committed-offset store          |
 
 A Kafka offset is the message's yasdb sequence number. Run with one Maelstrom

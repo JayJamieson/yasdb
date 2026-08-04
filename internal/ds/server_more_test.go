@@ -66,7 +66,7 @@ func TestDormancyRespawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)
-	defer func() { ts.Close(); srv.Close() }()
+	defer func() { ts.Close(); _ = srv.Close() }()
 
 	do(t, ts, "PUT", "/dr", "", hdr("Content-Type", "text/plain")).Body.Close()
 	do(t, ts, "POST", "/dr", "one", hdr("Content-Type", "text/plain")).Body.Close()
@@ -167,11 +167,12 @@ func TestNowOnClosedStream(t *testing.T) {
 	resp.Body.Close()
 }
 
-// TestLongPollDeleteNoGhost is the regression for the zombie-streamer race: once
-// DELETE has returned, a long-poll must behave exactly like catch-up — 404 with
-// no record data — even though background record deletion may still be running.
-// (Previously a stale streamer could be spawned from already-deleted meta and
-// keep serving ghost records to long-poll/SSE while catch-up 404'd.)
+// TestLongPollDeleteNoGhost is the regression for the zombie-streamer
+// race: once DELETE has returned, a long-poll must behave exactly like
+// catch-up — 404 with no record data — even though background record
+// deletion may still be running. (Previously, a stale streamer could be
+// spawned from already-deleted meta and keep serving ghost records to
+// long-poll/SSE while catch-up 404'd.)
 func TestLongPollDeleteNoGhost(t *testing.T) {
 	ts := newTestServer(t)
 	for i := 0; i < 60; i++ {
@@ -241,7 +242,7 @@ func newTestServerCfg(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatalf("new server: %v", err)
 	}
 	ts := httptest.NewServer(srv)
-	t.Cleanup(func() { ts.Close(); srv.Close() })
+	t.Cleanup(func() { ts.Close(); _ = srv.Close() })
 	return ts
 }
 
@@ -362,8 +363,9 @@ func min(a, b int) int {
 }
 
 // TestConcurrentCloseNoDeadlock exercises Server.Close() while streamers are
-// retiring on dormancy — the two paths take regMu and st.mu in opposite orders,
-// so a naive Close deadlocks. A hang here is caught by the timeout.
+// retiring on dormancy — the two paths take the registry shard lock and st.mu
+// in opposite orders, so a naive Close deadlocks. A hang here is caught by
+// the timeout.
 func TestConcurrentCloseNoDeadlock(t *testing.T) {
 	for trial := 0; trial < 10; trial++ {
 		srv, err := NewServer(openTestStore(t, 5*time.Millisecond), Config{DormancyTimeout: time.Millisecond, SweepInterval: 5 * time.Millisecond})
@@ -380,7 +382,7 @@ func TestConcurrentCloseNoDeadlock(t *testing.T) {
 		}
 
 		done := make(chan struct{})
-		go func() { srv.Close(); close(done) }()
+		go func() { _ = srv.Close(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):

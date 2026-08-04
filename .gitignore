@@ -37,6 +37,10 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+# Live State UI bundle build tooling — ui/dist/live-state.bundle.js (the
+# go:embed'd build output) is tracked; only node_modules is not.
+/ui/node_modules/
+
 # Go workspace file
 go.work
 go.work.sum

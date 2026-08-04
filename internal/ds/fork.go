@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// segment is a contiguous run of sequence numbers [startSeq, endSeq) that lives
-// in a single stream's own storage. Reading a fork stitches its inherited source
-// segments and its own segment together (SPEC.md §11, protocol §4.2).
+// segment is a contiguous run of sequence numbers [startSeq, endSeq) that
+// lives in a single stream's own storage. Reading a fork stitches its
+// inherited source segments and its own segment together.
 type segment struct {
 	id       uint64
 	startSeq uint64
@@ -16,9 +16,9 @@ type segment struct {
 }
 
 // resolveSegments maps the read range [startSeq, endSeq) of a stream to the
-// concrete (streamID, seqRange) segments that hold the data, walking the fork
-// chain. The top-level fork info is passed in (no DB read for the common
-// non-fork case); deeper sources are loaded by id.
+// concrete (streamID, seqRange) segments that hold the data. It walks the
+// fork chain. The caller passes in the top-level fork info, so there is no
+// DB read for the common non-fork case; deeper sources are loaded by id.
 func (s *Server) resolveSegments(id, forkedFrom, forkOffset, startSeq, endSeq uint64) ([]segment, error) {
 	if startSeq >= endSeq {
 		return nil, nil
@@ -54,8 +54,8 @@ func (s *Server) resolveSegmentsByID(id, startSeq, endSeq uint64) ([]segment, er
 		return nil, err
 	}
 	if !ok {
-		// Source vanished (should not happen — forks keep sources alive). Treat
-		// the range as empty rather than erroring.
+		// The source vanished. This should not happen: forks keep sources
+		// alive. Treat the range as empty rather than erroring.
 		return nil, nil
 	}
 	return s.resolveSegments(id, meta.ForkedFrom, meta.ForkOffset, startSeq, endSeq)
@@ -118,7 +118,7 @@ type forkParams struct {
 	body          []byte
 }
 
-// createFork creates a forked stream (SPEC §11, protocol §4.2). Holds metaMu.
+// createFork creates a forked stream. Holds metaMu.
 func (s *Server) createFork(p forkParams) createResult {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
@@ -192,8 +192,8 @@ func (s *Server) createFork(p forkParams) createResult {
 		subOffset = n
 	}
 
-	// Resolve the effective divergence (divSeq, divByte). Materialisation happens
-	// only for a mid-record binary divergence (divByte > 0).
+	// Resolve the effective divergence (divSeq, divByte). Materialisation
+	// only happens for a mid-record binary divergence (divByte > 0).
 	divSeq, divByte := forkOff.Seq, forkOff.Byte
 	if sourceJSON {
 		divSeq = forkOff.Seq + subOffset

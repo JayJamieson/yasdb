@@ -4,6 +4,7 @@ import (
 	"mime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,26 +50,29 @@ type Config struct {
 	SweepInterval   time.Duration // how often the expiry sweeper runs
 	MaxReadBytes    uint64        // soft cap on bytes returned per read
 
-	// LiveCoalesceWindow bounds how often parked live readers (long-poll/SSE) are
-	// woken for new commits. 0 (default) wakes on every commit — the original
-	// behavior. A small positive value (e.g. 2–5ms) folds a burst of commits into
-	// one wake via leading-edge debounce, taming the fan-out thundering herd under
-	// high commit-rate × many readers (see livewaker.go, BENCHMARKS.md). Adds at
-	// most this much latency to live delivery for hot streams; none for quiet ones.
+	// LiveCoalesceWindow bounds how often parked live readers (long-poll/SSE)
+	// wake for new commits. 0 (default) wakes on every commit, the original
+	// behavior. A small positive value (e.g. 2-5ms) folds a burst of commits
+	// into one wake via leading-edge debounce, taming the fan-out
+	// thundering herd under a high commit rate with many readers (see
+	// livewaker.go, BENCHMARKS.md). This adds at most this much latency to
+	// live delivery for hot streams, and none for quiet ones.
 	LiveCoalesceWindow time.Duration
 
-	// DisableLiveCache turns off the in-memory recent-records cache that lets
-	// caught-up live readers assemble their next chunk without a store scan
-	// (livecache.go). Default (false) keeps it on. An escape hatch / benchmarking
-	// knob; correctness is identical either way (the cache falls back to readRange).
+	// DisableLiveCache turns off the in-memory recent-records cache that
+	// lets caught-up live readers assemble their next chunk without a store
+	// scan (livecache.go). The default (false) keeps it on. This is an
+	// escape hatch and benchmarking knob; correctness is identical either
+	// way, since the cache falls back to readRange.
 	DisableLiveCache bool
 
-	// LiveCacheMaxRecords / LiveCacheMaxBytes bound the per-stream cache retained
-	// window (whichever binds first). 0 uses the defaults (512 records / 256 KiB).
-	// A caught-up reader only needs the last few commits, so this is small; a
-	// reader lagging beyond the window falls back to a store scan for that read.
-	// Lower to cut memory on many-hot-stream deployments; raise to serve laggier
-	// readers from RAM.
+	// LiveCacheMaxRecords and LiveCacheMaxBytes bound the per-stream cache
+	// retained window (whichever binds first). 0 uses the defaults (512
+	// records / 256 KiB). A caught-up reader only needs the last few
+	// commits, so this is small. A reader lagging beyond the window falls
+	// back to a store scan for that read. Lower this to cut memory on
+	// many-hot-stream deployments; raise it to serve laggier readers from
+	// RAM.
 	LiveCacheMaxRecords int
 	LiveCacheMaxBytes   int
 
@@ -76,9 +80,20 @@ type Config struct {
 	//   "" / "sync"   — block each group-commit on a durable write (default).
 	//   "notifier"    — write non-durably and ack via the durable-seq notifier;
 	//                   appends pipeline instead of blocking on the flush.
-	// Both ack Stream-Next-Offset only once the data is durable.
+	// Both modes acknowledge Stream-Next-Offset only once the data is durable.
 	Durability           string
-	NotifierPollInterval time.Duration // durable-seq poll cadence (notifier mode)
+	NotifierPollInterval time.Duration // durable-seq poll interval (notifier mode)
+
+	// CommitterWorkers sizes the shared committer pool (notifier mode only
+	// — see commit.go's sharedCommitter, RFC 0001). 0 means:
+	// runtime.GOMAXPROCS(0). A committer is a goroutine that does real
+	// CommitAsync work, unlike a registry shard (just a mutex and a map).
+	// More of them means smaller batches per committer, so this should
+	// track core count, not stream count.
+	CommitterWorkers int
+	// CommitterBatchMax bounds how many different streams' bursts one
+	// committer folds into a single WriteBatch. 0 = defaultCommitterBatchMax.
+	CommitterBatchMax int
 }
 
 // Server implements the Durable Streams HTTP surface over a Storage backend.
@@ -86,19 +101,33 @@ type Server struct {
 	store Storage
 	cfg   Config
 
-	regMu     sync.Mutex
-	streamers map[string]*streamer
+	registry *streamerRegistry
+
+	// spawnLocks serializes getOrSpawn's spawn path against a concurrent
+	// delete for the same stream (see spawnLockShardCount in registry.go).
+	// metaMu still serializes everything else: id allocation, create/fork
+	// idempotency, and delete's cascade. This is narrower than a full
+	// metaMu sharding on purpose, since getOrSpawn never touches nextID.
+	spawnLocks *spawnLocks
 
 	metaMu sync.Mutex
 	nextID uint64
+
+	// appendRequests and appendRecords count successful (2xx) POST
+	// appends, for yasdb_append_requests_total and
+	// yasdb_append_records_total (metrics.go). These are tracked in Go,
+	// not derived from a storage-backend metric, so throughput is
+	// measurable via Prometheus rate() over an exact window.
+	appendRequests atomic.Uint64
+	appendRecords  atomic.Uint64
 
 	committer committer      // durability strategy (sync / notifier)
 	sweepStop chan struct{}  // closed on Close to stop the sweeper
 	bgwg      sync.WaitGroup // tracks the sweeper + background delete goroutines
 }
 
-// NewServer builds a Server over store, recovering the id counter and resuming
-// any interrupted deletions.
+// NewServer builds a Server over store. It recovers the id counter and
+// resumes any interrupted deletions.
 func NewServer(store Storage, cfg Config) (*Server, error) {
 	if cfg.MaxRecordBytes == 0 {
 		cfg.MaxRecordBytes = 4 << 20
@@ -125,11 +154,12 @@ func NewServer(store Storage, cfg Config) (*Server, error) {
 		cfg.LiveCacheMaxBytes = defaultLiveCacheMaxBytes
 	}
 	s := &Server{
-		store:     store,
-		cfg:       cfg,
-		streamers: make(map[string]*streamer),
-		nextID:    1,
-		sweepStop: make(chan struct{}),
+		store:      store,
+		cfg:        cfg,
+		registry:   newStreamerRegistry(),
+		spawnLocks: newSpawnLocks(),
+		nextID:     1,
+		sweepStop:  make(chan struct{}),
 	}
 	if v, found, err := store.Get(idCounterKey()); err != nil {
 		return nil, err
@@ -145,26 +175,23 @@ func NewServer(store Storage, cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Close shuts down resident streamers and the store. Callers must stop accepting
-// requests first (main.go drains the HTTP server before calling Close): freeing
-// the native store while an FFI call is in flight is a use-after-free.
+// Close shuts down resident streamers and the store. Callers must stop
+// accepting requests first (main.go drains the HTTP server before calling
+// Close): freeing the native store while an FFI call is in flight is a
+// use-after-free.
 func (s *Server) Close() error {
 	close(s.sweepStop)
 	_ = s.committer.close()
-	// Join the sweeper and any in-flight background deletions before freeing the
-	// store, so a range-delete scan can never hit an already-destroyed handle.
+	// Join the sweeper and any in-flight background deletions before
+	// freeing the store, so a range-delete scan can never hit an
+	// already-destroyed handle.
 	s.bgwg.Wait()
 
-	// Snapshot and clear the registry under regMu, then stop each streamer WITHOUT
-	// holding regMu. Locking st.mu while holding regMu would invert the lock order
-	// used by tryRetire (st.mu -> regMu via unregister) and could deadlock.
-	s.regMu.Lock()
-	sts := make([]*streamer, 0, len(s.streamers))
-	for _, st := range s.streamers {
-		sts = append(sts, st)
-	}
-	s.streamers = make(map[string]*streamer)
-	s.regMu.Unlock()
+	// Snapshot and clear the registry, then stop each streamer WITHOUT
+	// holding any shard lock. Locking st.mu while holding a shard lock
+	// would invert the lock order tryRetire uses (st.mu -> shard.mu via
+	// unregister), and could deadlock.
+	sts := s.registry.drain()
 
 	for _, st := range sts {
 		st.mu.Lock()
@@ -213,36 +240,33 @@ func (s *Server) loadTailSeq(id uint64) (uint64, error) {
 
 // --- streamer registry ---
 
-// getOrSpawn returns the resident streamer for path, spawning one from durable
-// state if needed. found is false when the stream does not exist.
+// getOrSpawn returns the resident streamer for path, spawning one from
+// durable state if needed. found is false when the stream does not exist.
 //
-// The spawn path is serialised with create/delete via metaMu so a streamer can
-// never be registered from meta that a concurrent DELETE has already removed
-// (which would otherwise leave a "zombie" streamer serving ghost records during
-// background deletion). Once resident, appends and live reads hit only the
-// lock-free fast path below.
+// The spawn path is serialised with create/delete via metaMu, so a
+// streamer can never be registered from meta that a concurrent DELETE has
+// already removed. Without that, a "zombie" streamer could serve ghost
+// records during background deletion. Once resident, appends and live
+// reads hit only the lock-free fast path below.
 func (s *Server) getOrSpawn(path string) (*streamer, bool, error) {
-	s.regMu.Lock()
-	if st, ok := s.streamers[path]; ok {
-		s.regMu.Unlock()
+	if st, ok := s.registry.get(path); ok {
 		return st, true, nil
 	}
-	s.regMu.Unlock()
 
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
+	mu := s.spawnLocks.lockFor(path)
+	mu.Lock()
+	defer mu.Unlock()
 
-	// Another goroutine may have spawned it while we waited for metaMu.
-	s.regMu.Lock()
-	if st, ok := s.streamers[path]; ok {
-		s.regMu.Unlock()
+	// Another goroutine may have spawned it while we waited for the lock.
+	if st, ok := s.registry.get(path); ok {
 		return st, true, nil
 	}
-	s.regMu.Unlock()
 
-	// metaMu is held, so DELETE cannot interleave: either it already removed the
-	// stream (loadMeta returns not-found here) or it runs strictly after we
-	// register, in which case removeStreamer will retire this streamer.
+	// This path's spawn-lock shard is held, so DELETE for THIS path cannot
+	// interleave. removeStreamerLocked (expiry.go) takes the same shard, so
+	// either it already removed the stream (loadMeta returns not-found
+	// here), or it runs strictly after we register, in which case
+	// removeStreamer will retire this streamer.
 	meta, ok, err := s.loadMeta(path)
 	if err != nil || !ok {
 		return nil, false, err
@@ -253,15 +277,14 @@ func (s *Server) getOrSpawn(path string) (*streamer, bool, error) {
 	}
 
 	st := newStreamer(s, path, meta, tailSeq)
-	s.regMu.Lock()
-	s.streamers[path] = st
-	s.regMu.Unlock()
+	s.registry.set(path, st)
 	go st.run()
 	return st, true, nil
 }
 
-// touchStream signals the owning streamer to slide the sliding-TTL window for a
-// read. Non-blocking and best-effort; coalesces via the buffered touch channel.
+// touchStream signals the owning streamer to slide the sliding-TTL window
+// for a read. It is non-blocking and best-effort, and coalesces via the
+// buffered touch channel.
 func (s *Server) touchStream(path string) {
 	st, found, err := s.getOrSpawn(path)
 	if err != nil || !found {
@@ -279,22 +302,13 @@ func (s *Server) touchStream(path string) {
 
 // unregister removes st from the registry if it is still the current entry.
 func (s *Server) unregister(st *streamer) {
-	s.regMu.Lock()
-	if cur, ok := s.streamers[st.path]; ok && cur == st {
-		delete(s.streamers, st.path)
-	}
-	s.regMu.Unlock()
+	s.registry.deleteIfCurrent(st.path, st)
 }
 
-// removeStreamer forcibly retires the streamer for path (used by delete). Any
-// buffered appends are answered 404 by the streamer's stop drain.
+// removeStreamer forcibly retires the streamer for path, used by delete.
+// Any buffered appends are answered 404 by the streamer's stop drain.
 func (s *Server) removeStreamer(path string) {
-	s.regMu.Lock()
-	st := s.streamers[path]
-	if st != nil {
-		delete(s.streamers, path)
-	}
-	s.regMu.Unlock()
+	st := s.registry.deleteAndReturn(path)
 	if st == nil {
 		return
 	}
@@ -306,20 +320,33 @@ func (s *Server) removeStreamer(path string) {
 	st.mu.Unlock()
 }
 
-// submitAppend routes an append to the owning streamer, retrying if the streamer
-// retired between lookup and enqueue. found is false when the stream is gone.
-func (s *Server) submitAppend(path string, req appendReq) (appendResp, bool) {
+// submitAppend routes an append to the owning streamer, retrying if the
+// streamer retired between lookup and enqueue. found is false when the
+// stream is gone.
+//
+// hint, when non-nil, is used for the first attempt instead of a fresh
+// getOrSpawn lookup. Callers that already resolved the streamer themselves
+// (e.g. handlePost's own validation lookup) skip a redundant registry round
+// trip this way. This falls back to getOrSpawn on retry if the hinted
+// streamer is dead.
+func (s *Server) submitAppend(path string, req appendReq, hint *streamer) (appendResp, bool) {
+	st := hint
 	for {
-		st, found, err := s.getOrSpawn(path)
-		if err != nil {
-			return appendResp{status: 500, err: err}, true
-		}
-		if !found {
-			return appendResp{}, false
+		if st == nil {
+			var found bool
+			var err error
+			st, found, err = s.getOrSpawn(path)
+			if err != nil {
+				return appendResp{status: 500, err: err}, true
+			}
+			if !found {
+				return appendResp{}, false
+			}
 		}
 		st.mu.Lock()
 		if st.dead {
 			st.mu.Unlock()
+			st = nil
 			continue
 		}
 		req.resp = make(chan appendResp, 1)
@@ -329,15 +356,13 @@ func (s *Server) submitAppend(path string, req appendReq) (appendResp, bool) {
 	}
 }
 
-// liveState returns the current tail and closed status for a stream, preferring a
-// resident streamer's in-memory view and falling back to durable state. The
-// returned streamer is nil when the value came from durable state (no resident
-// streamer), so callers can distinguish live from loaded.
+// liveState returns the current tail and closed status for a stream. It
+// prefers a resident streamer's in-memory view, and falls back to durable
+// state. The returned streamer is nil when the value came from durable
+// state (no resident streamer), so callers can distinguish live from
+// loaded.
 func (s *Server) liveState(path string) (tail uint64, closed bool, st *streamer, found bool, err error) {
-	s.regMu.Lock()
-	resident := s.streamers[path]
-	s.regMu.Unlock()
-	if resident != nil {
+	if resident, ok := s.registry.get(path); ok {
 		return resident.tail.Load(), resident.closed.Load(), resident, true, nil
 	}
 	meta, ok, err := s.loadMeta(path)

@@ -1,0 +1,28 @@
+# In-region vegeta/loadshape load generator. Deploy in the SAME org + region
+# as the yasdb app.
+#
+# From the repo ROOT (build context must include benchmark/):
+#   fly apps create yasdb-loadtest
+#   fly deploy -c deploy/loadtest/fly.toml
+#
+# Then run tests against the private address (see deploy/loadtest/README.md):
+#   ./deploy/loadtest/run.sh max-throughput WORKERS=400 STREAMS=32
+
+app = "yasdb-loadtest"
+primary_region = "syd"     # match your yasdb app's region for lowest latency
+
+[build]
+  dockerfile = "Dockerfile"
+
+# No [http_service]: this is a client, not a server — it exposes no ports. It
+# joins the org's 6PN network automatically and reaches the target directly at
+# http://yasdb.internal:4437 (the process port, not the proxy).
+
+[[vm]]
+  # Size the LOAD GENERATOR so it isn't the bottleneck. Bumped from the
+  # original 2x/4gb after a stream-count sweep showed the generator pegged
+  # at 85-99.8% CPU well before yasdb did (checked via Fly instance metrics,
+  # not assumed) — see docs/DEPLOY.md's "Reading metrics from a load test".
+  cpu_kind = "performance"
+  cpus = 6
+  memory = "12gb"
