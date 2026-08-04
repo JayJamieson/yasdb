@@ -13,11 +13,22 @@ primary_region = 'syd'
   PORT = '4437'
   YASDB_DATA = '/data/yasdb'
   YASDB_DURABILITY = 'notifier'
-  YASDB_FLUSH = '2ms'
+  YASDB_FLUSH = '5ms'
+  YASDB_METRICS_ADDR = ':9091'
+  YASDB_COMPACTOR_MAX_SUBCOMPACTIONS = '8'
+  YASDB_ADMIN_BULK_PROVISION = '0'
 
 [[mounts]]
   source = 'yasdb_data'
   destination = '/data'
+
+# Native SlateDB engine metrics (write/compaction/cache/object-store), scraped
+# by Fly's platform over the private network — not exposed via [http_service]
+# — and visible in the org's built-in Grafana at fly-metrics.net. See
+# deploy/grafana-slatedb-dashboard.json for a starter dashboard.
+[metrics]
+  port = 9091
+  path = '/metrics'
 
 [http_service]
   internal_port = 4437
@@ -40,6 +51,6 @@ primary_region = 'syd'
 
 [[vm]]
   cpu_kind = "performance"
-  memory = '4gb'
-  cpus = 2
-  memory_mb = 4096
+  memory = '8gb'
+  cpus = 4
+  memory_mb = 8192

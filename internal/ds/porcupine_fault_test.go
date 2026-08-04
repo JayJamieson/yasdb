@@ -1,25 +1,28 @@
 package ds
 
-// Fault injection: linearizability of idempotent producers when appends fail
-// *indefinitely* — the client sends a request but never learns whether it became
-// durable. This is where the NondeterministicModel earns its keep and where the
-// exactly-once guarantee is actually tested: after an ambiguous append the client
-// retries the same (producerId, epoch, seq), and the model must reconcile the
-// retry's definite answer (204 duplicate ⇒ the original did commit; 200 accept ⇒
-// it did not) into a single legal order — with the record present exactly once.
+// Fault injection: linearizability of idempotent producers when appends
+// fail *indefinitely*. The client sends a request but never learns whether
+// it became durable. This is where the NondeterministicModel earns its
+// keep, and where the exactly-once guarantee is actually tested: after an
+// ambiguous append the client retries the same (producerId, epoch, seq),
+// and the model must reconcile the retry's definite answer (204 duplicate
+// means the original did commit; 200 accept means it did not) into a
+// single legal order, with the record present exactly once.
 //
-// A tiny in-process reverse proxy sits in front of the real server and, on a
-// deterministic fraction of POST (append) requests, injects one of two faults:
+// A tiny in-process reverse proxy sits in front of the real server and, on
+// a deterministic fraction of POST (append) requests, injects one of two
+// faults:
 //
-//   drop-request      — the request never reaches the server (not durable), then
-//                        the client connection is severed.
+//   drop-request      — the request never reaches the server (not durable),
+//                        then the client connection is severed.
 //   commit-then-drop  — the request is forwarded and fully processed by the
-//                        server (durable!), then the connection is severed before
-//                        the response reaches the client.
+//                        server (durable!), then the connection is severed
+//                        before the response reaches the client.
 //
-// Both look identical to the client: a transport error. Only the two together
-// exercise both nondeterministic branches (the retry sometimes accepts fresh,
-// sometimes dedups). Honors YASDB_TEST_DURABILITY (sync or notifier).
+// Both look identical to the client: a transport error. Only the two
+// together exercise both nondeterministic branches (the retry sometimes
+// accepts fresh, sometimes dedups). This honors YASDB_TEST_DURABILITY
+// (sync or notifier).
 
 import (
 	"bytes"
@@ -106,7 +109,7 @@ func forwardAndDiscard(cl *http.Client, backendURL string, r *http.Request) {
 func severConnection(w http.ResponseWriter) {
 	if hj, ok := w.(http.Hijacker); ok {
 		if conn, _, err := hj.Hijack(); err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return
 		}
 	}

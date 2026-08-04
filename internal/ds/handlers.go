@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// ServeHTTP routes a request to the matching stream operation. The request path
-// is the stream identifier; any URL scheme works (protocol §3). The reserved
-// `__ds` prefix (subscriptions) is not implemented.
+// ServeHTTP routes a request to the matching stream operation. The request
+// path is the stream identifier; any URL scheme works (protocol §3). The
+// reserved `__ds` prefix (subscriptions) is not implemented.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	if r.Method == http.MethodOptions {
@@ -25,6 +25,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	if path == adminStreamsPath {
+		s.handleAdminStreams(w, r)
+		return
+	}
 	if isReservedPath(path) {
 		http.Error(w, "subscription APIs are not implemented", http.StatusNotImplemented)
 		return
@@ -236,9 +240,10 @@ func (s *Server) createStream(p createParams) createResult {
 		Closed:      p.closed,
 		CreatedAtMs: now.UnixMilli(),
 	}
-	// Establish the initial expiry deadline (SPEC §10). Sliding TTL counts from
-	// now; Stream-Expires-At is absolute. The +1 on TTL guards against
-	// sub-second truncation of now so the stream never expires before now+TTL.
+	// Establish the initial expiry deadline. Sliding TTL counts
+	// from now; Stream-Expires-At is absolute. The +1 on TTL guards
+	// against sub-second truncation of now, so the stream never expires
+	// before now+TTL.
 	if p.ttlSet {
 		meta.Deadline = uint64(now.Unix()) + p.ttl + 1
 	} else if p.expiresSet && p.expiresAt > 0 {
@@ -297,35 +302,52 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		http.Error(w, "empty body requires Stream-Closed: true", http.StatusBadRequest)
 		return
 	}
-	// A body requires Content-Type (protocol §5.2); it MAY be omitted only when
-	// the body is empty (close-only).
+	// A body requires Content-Type (protocol §5.2). It MAY be omitted only
+	// when the body is empty (close-only).
 	if hasBody && strings.TrimSpace(reqCT) == "" {
 		http.Error(w, "Content-Type is required when a body is provided", http.StatusBadRequest)
 		return
 	}
 
-	// Soft-deleted streams are 410 for all direct operations.
-	if reason, _, found, err := s.loadTombstone(path); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	} else if found && reason == tombSoftDelete {
-		http.Error(w, "stream gone", http.StatusGone)
-		return
-	}
+	// An already-resident streamer can never coexist with a tombstone for
+	// its own path: removeStreamerLocked (expiry.go) always retires the
+	// streamer in the same spawn-lock critical section as writing the
+	// tombstone. So residency alone proves "not soft-deleted", with no
+	// store round trip needed. This is the common case (repeated appends
+	// to a warm stream); skipping the Get() removed about 13% of total CPU
+	// in a local pprof profile.
+	//
+	// A stream that is NOT yet resident still needs the tombstone check
+	// before getOrSpawn: soft-delete leaves meta in place (only
+	// hard-delete removes it), so getOrSpawn alone cannot tell "never
+	// existed" from "soft-deleted", and would happily respawn a streamer
+	// from stale meta.
+	st, found := s.registry.get(path)
+	if !found {
+		if reason, _, tombFound, err := s.loadTombstone(path); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		} else if tombFound && reason == tombSoftDelete {
+			http.Error(w, "stream gone", http.StatusGone)
+			return
+		}
 
-	st, found, err := s.getOrSpawn(path)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		var err error
+		st, found, err = s.getOrSpawn(path)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	if !found {
 		http.Error(w, "stream not found", http.StatusNotFound)
 		return
 	}
 
-	// Flatten the body into records only when it will actually be appended:
-	// the stream must be open and the content type must match. Closed/mismatch
-	// cases are resolved authoritatively by the streamer (correct precedence).
+	// Flatten the body into records only when it will actually be
+	// appended: the stream must be open and the content type must match.
+	// The streamer resolves closed/mismatch cases authoritatively (correct
+	// precedence).
 	var records [][]byte
 	if hasBody && !st.closed.Load() && contentTypeMatches(st.contentType, reqCT) {
 		if st.isJSON {
@@ -352,10 +374,14 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		closeStream: closeStream,
 		streamSeq:   streamSeq,
 		producer:    producer,
-	})
+	}, st) // st already resolved above — skip a redundant registry lookup
 	if !ok {
 		http.Error(w, "stream not found", http.StatusNotFound)
 		return
+	}
+	if resp.status == http.StatusOK || resp.status == http.StatusNoContent {
+		s.appendRequests.Add(1)
+		s.appendRecords.Add(uint64(len(records)))
 	}
 	s.writeAppendResponse(w, resp)
 }
@@ -471,7 +497,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	}
 
 	// A stream with outstanding forks is soft-deleted (retains data for fork
-	// readers, serves 410 on its own path); otherwise it is hard-deleted (SPEC §11).
+	// readers, serves 410 on its own path); otherwise it is hard-deleted.
 	var derr error
 	if s.loadRefCount(meta.StreamID) > 0 {
 		derr = s.softDeleteLocked(path, meta)

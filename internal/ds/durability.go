@@ -6,15 +6,16 @@ import (
 	"time"
 )
 
-// durabilityNotifier acks writes once the engine's durable watermark reaches
-// their assigned sequence number, instead of blocking each write on an fsync
-// (SPEC §6 "durability notifier"; the design s2-lite uses). One poller serves
-// every stream: appends never block on durability, so a single stream pipelines
-// many appends into one flush. Used when Config.Durability == "notifier".
+// durabilityNotifier acknowledges writes once the engine's durable watermark
+// reaches their assigned sequence number, instead of blocking each write on
+// an fsync. This is the "durability notifier" design, the one
+// s2-lite uses. One poller serves every stream: appends never block on
+// durability, so a single stream pipelines many appends into one flush.
+// yasdb uses this when Config.Durability == "notifier".
 //
-// The Go SlateDB binding exposes the durable watermark by poll (Db.Status()),
-// not a subscription, so this polls at a small interval; it only polls while
-// waiters are outstanding.
+// The Go SlateDB binding exposes the durable watermark by poll
+// (Db.Status()), not a subscription. So this polls at a small interval, and
+// only while waiters are outstanding.
 type durabilityNotifier struct {
 	store    Storage
 	interval time.Duration
@@ -47,15 +48,16 @@ func newDurabilityNotifier(store Storage, interval time.Duration) *durabilityNot
 	return n
 }
 
-// subscribe invokes cb exactly once: with nil when the durable watermark reaches
-// target, or with an error if the store is (or becomes) closed.
+// subscribe invokes cb exactly once: with nil when the durable watermark
+// reaches target, or with an error if the store is, or becomes, closed.
 //
 // The callback always fires from the single poller goroutine (poll -> fire),
-// never synchronously here — even when target is already durable. That keeps
-// callbacks totally ordered by target, which the notifier committer relies on:
-// applyReader publishes the reader-visible tail per burst, and firing an
+// never synchronously here, even when target is already durable. That keeps
+// callbacks totally ordered by target, which the notifier committer relies
+// on: applyReader publishes the reader-visible tail per burst. Firing an
 // already-durable subscribe on the caller's goroutine could race the poller
-// firing an earlier burst, regressing the tail and breaking read-after-ack.
+// firing an earlier burst, which would regress the tail and break
+// read-after-ack.
 func (n *durabilityNotifier) subscribe(target uint64, cb func(error)) {
 	n.mu.Lock()
 	if n.closed {

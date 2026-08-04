@@ -10,8 +10,9 @@ import (
 )
 
 // readChunkBytes is the default soft cap on bytes returned per read
-// (Config.MaxReadBytes). A non-JSON record larger than the cap is delivered
-// across reads via the offset byte-component; JSON messages are atomic (SPEC §4).
+// (Config.MaxReadBytes). A non-JSON record larger than the cap is
+// delivered across reads via the offset byte component. JSON messages are
+// atomic.
 const readChunkBytes = 1 << 20
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) {
@@ -70,11 +71,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 	}
 }
 
-// readRange assembles a response body for [start, tailSeq), accumulating up to
-// ~limit bytes. For application/json, messages are atomic (byte offset always 0).
-// For other content types, a record larger than the limit is delivered across
-// reads via the offset byte component (SPEC §4). Reads stitch a fork's inherited
-// source segments with its own data (SPEC §11).
+// readRange assembles a response body for [start, tailSeq), accumulating
+// up to about limit bytes. For application/json, messages are atomic (byte
+// offset always 0). For other content types, a record larger than the
+// limit is delivered across reads via the offset byte component.
+// Reads stitch a fork's inherited source segments with its own data.
 func (s *Server) readRange(streamID, forkedFrom, forkOffset uint64, isJSON bool, start Offset, tailSeq, limit uint64) (body []byte, next Offset, upToDate bool, err error) {
 	if start.Seq >= tailSeq {
 		if isJSON {
@@ -145,7 +146,7 @@ func (s *Server) readSegmentsBinary(segs []segment, start Offset, tailSeq, limit
 }
 
 // readSegmentsJSON collects whole JSON messages across segments and re-wraps them
-// in a single array (SPEC §9.1, §11).
+// in a single array.
 func (s *Server) readSegmentsJSON(segs []segment, start Offset, tailSeq, limit uint64) ([]byte, Offset, bool, error) {
 	var recs [][]byte
 	var total uint64
@@ -264,8 +265,8 @@ func (s *Server) readLongPoll(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	isJSON := st.isJSON
-	st.readers.Add(1)
-	defer st.readers.Add(-1)
+	st.longPollReaders.Add(1)
+	defer st.longPollReaders.Add(-1)
 
 	start := po.off
 	if po.isNow {
@@ -354,10 +355,10 @@ func (s *Server) write204Timeout(w http.ResponseWriter, tail uint64, clientCurso
 // --- SSE ---
 
 // sseControl is the per-delivery SSE control event. Its JSON is hand-rolled
-// (appendSSEControl) rather than json.Marshal'd: the fields are an offset
-// (digits + '_') and a cursor (decimal digits), both escape-free, so the output
-// is byte-identical to json.Marshal of the equivalent tagged struct — guarded by
-// TestSSEControlFrameMatchesJSON.
+// (appendSSEControl), not json.Marshal'd: the fields are an offset (digits
+// plus '_') and a cursor (decimal digits), both escape-free. So the output
+// is byte-identical to json.Marshal of the equivalent tagged struct,
+// guarded by TestSSEControlFrameMatchesJSON.
 type sseControl struct {
 	Next         Offset // streamNextOffset
 	StreamCursor string // streamCursor, omitempty
@@ -385,8 +386,8 @@ func (s *Server) readSSE(w http.ResponseWriter, r *http.Request, path string, me
 		return
 	}
 	isJSON := st.isJSON
-	st.readers.Add(1)
-	defer st.readers.Add(-1)
+	st.sseReaders.Add(1)
+	defer st.sseReaders.Add(-1)
 	textLike := isTextLike(meta.ContentType)
 
 	h := w.Header()
@@ -446,7 +447,7 @@ func (s *Server) readSSE(w http.ResponseWriter, r *http.Request, path string, me
 			continue
 		}
 		if closed {
-			ctrlBuf = writeSSEControl(w, ctrlBuf, sseControl{
+			writeSSEControl(w, ctrlBuf, sseControl{
 				Next:         tailOffset(tail),
 				UpToDate:     true,
 				StreamClosed: true,
@@ -502,19 +503,21 @@ func writeSSEData(w http.ResponseWriter, textLike bool, payload []byte) {
 		w.Write(sseNLNL)
 		return
 	}
-	// Fast path (the common case: a batch of newline-free records): the payload is
-	// one verbatim data line, written directly with no string conversion.
+	// Fast path (the common case: a batch of newline-free records). The
+	// payload is one verbatim data line, written directly with no string
+	// conversion.
 	if bytes.IndexByte(payload, '\n') < 0 && bytes.IndexByte(payload, '\r') < 0 {
 		w.Write(sseDataPrefix)
 		w.Write(payload)
 		w.Write(sseNLNL)
 		return
 	}
-	// Slow path: every CR, LF, and CRLF is an SSE line boundary, so we split on all
-	// of them and emit one `data:` field per line. This preserves the payload's own
-	// newlines as data and makes it impossible for an embedded blank line
-	// ("\r\n\r\n") to be read as an event boundary (CRLF/LF injection). No space
-	// after `data:` — the value is verbatim.
+	// Slow path: every CR, LF, and CRLF is an SSE line boundary. This
+	// splits on all of them and emits one `data:` field per line. This
+	// preserves the payload's own newlines as data, and makes it
+	// impossible for an embedded blank line ("\r\n\r\n") to be read as an
+	// event boundary (CRLF/LF injection). There is no space after `data:`
+	// — the value is verbatim.
 	normalized := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")
 	for _, line := range strings.Split(normalized, "\n") {
@@ -533,9 +536,10 @@ func writeSSEControl(w http.ResponseWriter, dst []byte, c sseControl) []byte {
 	return dst
 }
 
-// appendSSEControl appends the full `event: control\ndata:{…}\n\n` frame to dst.
-// Hand-rolled instead of json.Marshal; byte-identical because every value is
-// escape-free (offset digits/'_' and a decimal cursor).
+// appendSSEControl appends the full `event: control\ndata:{…}\n\n` frame to
+// dst. It is hand-rolled instead of json.Marshal, and byte-identical
+// because every value is escape-free (offset digits/'_' and a decimal
+// cursor).
 func appendSSEControl(dst []byte, c sseControl) []byte {
 	dst = append(dst, sseControlHead...)
 	dst = appendOffset(dst, c.Next)

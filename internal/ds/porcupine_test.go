@@ -2,24 +2,26 @@ package ds
 
 // Linearizability checking with Porcupine (github.com/anishathalye/porcupine).
 //
-// Each stream is modelled as an append-only log — an independent linearizable
-// object, so the history is partitioned per stream (the classic register-per-key
-// pattern). Many clients concurrently append unique values and periodically read
-// the whole log back. Porcupine then searches for a single total order of the
-// appends that is consistent with (a) real-time: an op's linearization point
-// lies within its [call, return] interval, and (b) the observed outputs:
+// Each stream is modelled as an append-only log: an independent
+// linearizable object, so the history is partitioned per stream (the
+// classic register-per-key pattern). Many clients concurrently append
+// unique values and periodically read the whole log back. Porcupine then
+// searches for a single total order of the appends that is consistent
+// with (a) real-time: an op's linearization point lies within its [call,
+// return] interval, and (b) the observed outputs:
 //
-//   - append(v) returns Stream-Next-Offset, whose seq must equal len(log)+1 in
-//     that order — this pins the offset to a dense, gapless 1..N with no
-//     duplicates and no lost/torn appends;
+//   - append(v) returns Stream-Next-Offset, whose seq must equal
+//     len(log)+1 in that order. This pins the offset to a dense, gapless
+//     1..N with no duplicates and no lost/torn appends.
 //   - read() returns the full JSON array, which must equal the log at its
-//     linearization point — this catches reordering, dirty reads, and stale tails.
+//     linearization point. This catches reordering, dirty reads, and
+//     stale tails.
 //
-// yasdb serialises appends per stream through a single streamer goroutine, so
-// this should always be linearizable; the test is a differential guard on the
-// concurrency + durability machinery (run it in both durability modes via
-// YASDB_TEST_DURABILITY=notifier). On a violation it writes an interactive HTML
-// visualization and fails with its path.
+// yasdb serialises appends per stream through a single streamer goroutine,
+// so this should always be linearizable. The test is a differential guard
+// on the concurrency and durability machinery (run it in both durability
+// modes via YASDB_TEST_DURABILITY=notifier). On a violation, it writes an
+// interactive HTML visualization and fails with its path.
 
 import (
 	"encoding/json"

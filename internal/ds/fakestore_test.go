@@ -8,11 +8,12 @@ import (
 )
 
 // fakeStore is an in-memory Storage used by the functional tests: a second
-// implementation of the persistence seam that needs no cgo / SlateDB and behaves
-// deterministically. Keys sort byte-wise (matching SlateDB, which the big-endian
-// key encoding relies on), Commit is atomic, and writes are durable the instant
-// they land — so CommitAsync assigns a monotonic seq that DurableSeq immediately
-// reflects, exercising the notifier durability path without real flush latency.
+// implementation of the persistence seam that needs no cgo/SlateDB and
+// behaves deterministically. Keys sort byte-wise, matching SlateDB, which
+// the big-endian key encoding relies on. Commit is atomic, and writes are
+// durable the instant they land. So CommitAsync assigns a monotonic seq
+// that DurableSeq immediately reflects, exercising the notifier durability
+// path without real flush latency.
 //
 // Set YASDB_TEST_BACKEND=slatedb to run the same suite against the real store.
 type fakeStore struct {
@@ -33,11 +34,22 @@ func openTestStore(tb interface {
 	Fatalf(string, ...any)
 }, flush time.Duration) Storage {
 	tb.Helper()
-	if os.Getenv("YASDB_TEST_BACKEND") == "slatedb" {
+	switch os.Getenv("YASDB_TEST_BACKEND") {
+	case "slatedb":
 		path := uniqueDBPath("test")
-		store, err := OpenStore(path, "memory:///", flush)
+		store, err := OpenStore(path, "memory:///", StoreTuning{FlushInterval: flush})
 		if err != nil {
 			tb.Fatalf("open store: %v", err)
+		}
+		return store
+	case "pwal":
+		dir, err := os.MkdirTemp("", "yasdb-pwal-test-*")
+		if err != nil {
+			tb.Fatalf("mkdir temp: %v", err)
+		}
+		store, err := OpenPWALStore(dir, 4)
+		if err != nil {
+			tb.Fatalf("open pwal store: %v", err)
 		}
 		return store
 	}

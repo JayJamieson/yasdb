@@ -363,8 +363,8 @@ func replyErr(in message, inReplyTo int64, err error) {
 func send(m message) {
 	line := mustJSON(m)
 	outMu.Lock()
-	os.Stdout.Write(line)
-	os.Stdout.Write([]byte{'\n'})
+	_, _ = os.Stdout.Write(line)
+	_, _ = os.Stdout.Write([]byte{'\n'})
 	outMu.Unlock()
 }
 

@@ -5,14 +5,14 @@ import (
 	"strconv"
 )
 
-// Offset is a position within a stream. The wire format matches the reference
-// implementations (SPEC.md §4): `<seq>_<byteOffset>`, both 16-digit zero-padded
-// decimals, e.g. "0000000000000042_0000000000000000".
+// Offset is a position within a stream. The wire format matches the
+// reference implementations: `<seq>_<byteOffset>`, both
+// 16-digit zero-padded decimals, e.g. "0000000000000042_0000000000000000".
 //
 //   - Seq is the next RecordData sequence number to read.
-//   - Byte is how many bytes of that record have already been delivered; it is
-//     non-zero only when a single record exceeded a read's byte limit and is
-//     always 0 for application/json streams.
+//   - Byte is how many bytes of that record have already been delivered.
+//     It is non-zero only when a single record exceeded a read's byte
+//     limit. It is always 0 for application/json streams.
 type Offset struct {
 	Seq  uint64
 	Byte uint64
@@ -27,9 +27,9 @@ func (o Offset) String() string {
 	return string(appendOffset(make([]byte, 0, offsetTokenLen), o))
 }
 
-// appendOffset appends the fixed-width wire form (<16-digit seq>_<16-digit byte>)
-// to dst. Hand-rolled to avoid fmt reflection/allocation on the hot live-read
-// control-frame path.
+// appendOffset appends the fixed-width wire form (<16-digit seq>_<16-digit
+// byte>) to dst. It is hand-rolled to avoid fmt reflection and allocation on
+// the hot live-read control-frame path.
 func appendOffset(dst []byte, o Offset) []byte {
 	dst = appendPad16(dst, o.Seq)
 	dst = append(dst, '_')
@@ -61,9 +61,9 @@ type parsedOffset struct {
 //   - "now" -> the current tail (isNow=true); the caller resolves it.
 //   - a real 33-char token -> the encoded position.
 //
-// Any other value is malformed and yields errBadOffset (HTTP 400). The sentinels
-// "-1" and "now" can never collide with minted offsets, which are always 33
-// characters of digits and one underscore (SPEC §4, protocol §8).
+// Any other value is malformed and yields errBadOffset (HTTP 400). The
+// sentinels "-1" and "now" can never collide with minted offsets: minted
+// offsets are always 33 characters of digits and one underscore.
 func parseOffset(raw string) (parsedOffset, error) {
 	switch raw {
 	case "", "-1":

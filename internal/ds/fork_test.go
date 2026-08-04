@@ -5,6 +5,54 @@ import (
 	"time"
 )
 
+// TestForkCascadeDeleteSpawnLockCollision forces the fork path and its
+// source path to hash to the SAME spawnLockShardCount shard
+// (fnv1a("/collision-src")%64 == fnv1a("/collision-fork-43")%64, found by
+// brute force, not by chance), then deletes the fork to trigger
+// dropForkRef's cascade into deleteStreamLocked for the source.
+// removeStreamerLocked (expiry.go) is scoped tightly to just "retire
+// streamer and commit," specifically so this cascade's own spawnLocks
+// acquisition (for the source, a different path) never nests inside the
+// fork-delete's already-released acquisition. If that scoping regressed,
+// this test would deadlock on the same goroutine trying to Lock() a shard
+// it still held, instead of failing cleanly.
+func TestForkCascadeDeleteSpawnLockCollision(t *testing.T) {
+	const srcPath = "/collision-src"
+	const forkPath = "/collision-fork-43"
+	if fnv1a(srcPath)%spawnLockShardCount != fnv1a(forkPath)%spawnLockShardCount {
+		t.Fatalf("test paths no longer collide (shard changed?): src=%d fork=%d",
+			fnv1a(srcPath)%spawnLockShardCount, fnv1a(forkPath)%spawnLockShardCount)
+	}
+
+	ts := newTestServerCfg(t, Config{SweepInterval: time.Hour})
+	do(t, ts, "PUT", srcPath, "data", hdr("Content-Type", "text/plain")).Body.Close()
+	wantStatus(t, do(t, ts, "PUT", forkPath, "", hdr("Stream-Forked-From", srcPath), hdr("Content-Type", "text/plain")), 201)
+
+	// The source has a fork referencing it, so it soft-deletes (retained
+	// for the fork).
+	wantStatus(t, do(t, ts, "DELETE", srcPath, ""), 204)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Deleting the fork drops the source's last ref, cascading to
+		// hard-delete the source via dropForkRef -> deleteStreamLocked
+		// (srcPath, ...), which acquires srcPath's spawnLocks shard. This
+		// is the SAME shard forkPath's own deleteStreamLocked call already
+		// acquired, and (if scoped correctly) already released, before
+		// this cascade runs.
+		wantStatus(t, do(t, ts, "DELETE", forkPath, ""), 204)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cascade delete did not complete within 10s — likely a spawnLocks self-deadlock on the shard collision")
+	}
+
+	time.Sleep(150 * time.Millisecond) // background cleanup
+	wantStatus(t, do(t, ts, "GET", srcPath+"?offset=-1", ""), 404)
+}
+
 func TestForkInheritsPrefix(t *testing.T) {
 	ts := newTestServer(t)
 	// source: "first", then "second" (2 records)
@@ -90,6 +138,11 @@ func TestForkSoftDeleteLifecycle(t *testing.T) {
 	wantStatus(t, do(t, ts, "HEAD", "/sd", ""), 410)
 	wantStatus(t, do(t, ts, "GET", "/sd?offset=-1", ""), 410)
 	wantStatus(t, do(t, ts, "DELETE", "/sd", ""), 410)
+	// POST must also 410, not silently respawn a streamer from the
+	// still-present meta. Soft-delete leaves meta in place; only
+	// removeStreamer and the tombstone key are written (see handlePost's
+	// not-resident tombstone check).
+	wantStatus(t, do(t, ts, "POST", "/sd", "x", hdr("Content-Type", "text/plain")), 410)
 	// re-create blocked
 	wantStatus(t, do(t, ts, "PUT", "/sd", "", hdr("Content-Type", "text/plain")), 409)
 	// fork still reads the inherited data

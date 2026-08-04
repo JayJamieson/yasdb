@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.backend }}${{ matrix.durability != '' && format(', {0}', matrix.durability) || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: fake
+            durability: ""
+          - backend: fake
+            durability: notifier
+          - backend: slatedb
+            durability: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure cgo env
+        run: |
+          echo "CGO_LDFLAGS=-L${{ github.workspace }}/lib -Wl,-rpath,${{ github.workspace }}/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/lib" >> "$GITHUB_ENV"
+          echo "YASDB_TEST_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          echo "YASDB_TEST_DURABILITY=${{ matrix.durability }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (-race)
+        run: go test -race ./...
+
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "The following files need gofmt:"
+            echo "$out"
+            exit 1
+          fi
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Configure cgo env
+        run: |
+          echo "CGO_LDFLAGS=-L${{ github.workspace }}/lib -Wl,-rpath,${{ github.workspace }}/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/lib" >> "$GITHUB_ENV"
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2

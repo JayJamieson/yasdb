@@ -15,17 +15,17 @@ import (
 	"time"
 )
 
-// newLiveTestServer builds a server over the default test store (fake unless
-// YASDB_TEST_BACKEND=slatedb) and returns both the endpoint and the underlying
-// *Server so tests can inspect streamer state.
+// newLiveTestServer builds a server over the default test store (fake
+// unless YASDB_TEST_BACKEND=slatedb) and returns both the endpoint and the
+// underlying *Server, so tests can inspect streamer state.
 func newLiveTestServer(tb testing.TB, cfg Config, flush time.Duration) (*httptest.Server, *Server) {
 	tb.Helper()
 	return startServer(tb, openTestStore(tb, flush), cfg)
 }
 
 // TestSSEControlFrameMatchesJSON pins the hand-rolled control frame
-// (appendSSEControl) to exactly what json.Marshal of the equivalent tagged struct
-// would produce, across offsets / cursors / flag combinations.
+// (appendSSEControl) to exactly what json.Marshal of the equivalent tagged
+// struct would produce, across offset, cursor, and flag combinations.
 func TestSSEControlFrameMatchesJSON(t *testing.T) {
 	type sseControlJSON struct {
 		StreamNextOffset string `json:"streamNextOffset"`
@@ -51,10 +51,10 @@ func TestSSEControlFrameMatchesJSON(t *testing.T) {
 	}
 }
 
-// TestLiveCacheMatchesStore is the differential correctness guard for the record
-// cache: whenever the cache serves a read (ok=true) it must return exactly what a
-// store scan (readRange) would — same body bytes, next offset, and up-to-date
-// flag — for both binary and JSON streams.
+// TestLiveCacheMatchesStore is the differential correctness guard for the
+// record cache: whenever the cache serves a read (ok=true), it must return
+// exactly what a store scan (readRange) would — same body bytes, next
+// offset, and up-to-date flag — for both binary and JSON streams.
 func TestLiveCacheMatchesStore(t *testing.T) {
 	cases := []struct {
 		name string
@@ -78,12 +78,12 @@ func TestLiveCacheMatchesStore(t *testing.T) {
 			if err != nil || !found {
 				t.Fatalf("spawn: found=%v err=%v", found, err)
 			}
-			st.readers.Add(1) // so applyReader populates the cache
+			st.longPollReaders.Add(1) // so applyReader populates the cache
 
 			for i := 0; i < n; i++ {
 				resp, ok := srv.submitAppend("/diff", appendReq{
 					records: [][]byte{tc.rec(i)}, hasBody: true, contentType: tc.ct,
-				})
+				}, nil)
 				if !ok || (resp.status != 204 && resp.status != 200) {
 					t.Fatalf("append %d: ok=%v status=%d", i, ok, resp.status)
 				}
@@ -175,8 +175,8 @@ func FuzzLiveCacheMatchesStore(f *testing.F) {
 		if err != nil || !found {
 			t.Fatalf("spawn: %v", err)
 		}
-		st.readers.Add(1) // so the commit populates the cache
-		if resp, ok := srv.submitAppend("/fz", appendReq{records: recs, hasBody: true, contentType: ct}); !ok || (resp.status != 204 && resp.status != 200) {
+		st.longPollReaders.Add(1) // so the commit populates the cache
+		if resp, ok := srv.submitAppend("/fz", appendReq{records: recs, hasBody: true, contentType: ct}, nil); !ok || (resp.status != 204 && resp.status != 200) {
 			t.Fatalf("append: ok=%v status=%d", ok, resp.status)
 		}
 		tail := st.tail.Load()
@@ -308,7 +308,7 @@ func runFanout(tb testing.TB, ts *httptest.Server, srv *Server, path string, rea
 	for i := 0; i < commits; i++ {
 		resp, ok := srv.submitAppend(path, appendReq{
 			records: [][]byte{[]byte(rec(i))}, hasBody: true, contentType: "text/plain",
-		})
+		}, nil)
 		if !ok || (resp.status != 204 && resp.status != 200) {
 			res.err = fmt.Errorf("append %d: ok=%v status=%d", i, ok, resp.status)
 			return res

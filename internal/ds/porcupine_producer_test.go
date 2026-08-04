@@ -1,22 +1,24 @@
 package ds
 
-// Linearizability of yasdb's idempotent producers (SPEC §9 / protocol §5.2.1).
+// Linearizability of yasdb's idempotent producers.
 //
 // This extends the plain-append check in porcupine_test.go to the producer
-// state machine: per (stream, producerId) epoch fencing + per-batch sequence
-// dedup. It borrows two techniques from the s2-streamstore/s2-verification
-// model (s2-porcupine):
+// state machine: per (stream, producerId) epoch fencing plus per-batch
+// sequence dedup. It borrows two techniques from the
+// s2-streamstore/s2-verification model (s2-porcupine):
 //
-//   1. porcupine.NondeterministicModel — Step returns the *set* of possible next
-//      states. Definite outcomes return a single state; an empty set means the
-//      observed result is impossible (a linearizability violation). This is the
-//      shape that also lets an "indefinite" (timed-out) append be modelled as
-//      {maybe-durable, not-durable} once fault injection is added.
-//   2. A constant-size chained content hash. Instead of storing the whole log,
-//      the state carries one uint64 = fold(chainHash) over every committed record
-//      body in order. A read folds the same function over the records it returns;
-//      any reorder, drop, duplicate, or corruption changes the hash. State stays
-//      O(1) regardless of stream length.
+//   1. porcupine.NondeterministicModel — Step returns the *set* of
+//      possible next states. Definite outcomes return a single state; an
+//      empty set means the observed result is impossible (a
+//      linearizability violation). This shape also lets an "indefinite"
+//      (timed-out) append be modelled as {maybe-durable, not-durable} once
+//      fault injection is added.
+//   2. A constant-size chained content hash. Instead of storing the whole
+//      log, the state carries one uint64 = fold(chainHash) over every
+//      committed record body in order. A read folds the same function
+//      over the records it returns; any reorder, drop, duplicate, or
+//      corruption changes the hash. State stays O(1) regardless of stream
+//      length.
 //
 // Modelled producer outcomes (verified against internal/ds/streamer.go):
 //   accept (new data)   -> 200, Stream-Next-Offset seq = tail+1 ; tail++, lastSeq=seq
@@ -25,7 +27,8 @@ package ds
 //   bad seq start       -> 400 ; no write (epoch bumped but first seq != 0)
 //   gap                 -> 409 ; no write (seq > lastSeq+1)
 //
-// Every append here carries exactly one record, so tail advances by 1 per accept.
+// Every append here carries exactly one record, so tail advances by 1 per
+// accept.
 
 import (
 	"encoding/binary"

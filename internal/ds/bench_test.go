@@ -15,7 +15,7 @@ func benchServer(b *testing.B, storeURL string, flush time.Duration) *Server {
 	if storeURL == "" {
 		storeURL = "memory:///"
 	}
-	store, err := OpenStore(uniqueDBPath("bench"), storeURL, flush)
+	store, err := OpenStore(uniqueDBPath("bench"), storeURL, StoreTuning{FlushInterval: flush})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func benchServer(b *testing.B, storeURL string, flush time.Duration) *Server {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { srv.Close() })
+	b.Cleanup(func() { _ = srv.Close() })
 	return srv
 }
 
@@ -33,9 +33,9 @@ func benchFileServer(b *testing.B, flush time.Duration) *Server {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { os.RemoveAll(dir) })
+	b.Cleanup(func() { _ = os.RemoveAll(dir) })
 	dbp := strings.TrimPrefix(dir, "/") + "/db"
-	store, err := OpenStore(dbp, "file:///", flush)
+	store, err := OpenStore(dbp, "file:///", StoreTuning{FlushInterval: flush})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func benchFileServer(b *testing.B, flush time.Duration) *Server {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { srv.Close() })
+	b.Cleanup(func() { _ = srv.Close() })
 	return srv
 }
 
@@ -61,7 +61,7 @@ func mustCreate(b *testing.B, srv *Server, path, ct string) {
 var benchRec = [][]byte{[]byte("hello world")}
 
 func appendOnce(b *testing.B, srv *Server, path string) {
-	resp, ok := srv.submitAppend(path, appendReq{records: benchRec, hasBody: true, contentType: "text/plain"})
+	resp, ok := srv.submitAppend(path, appendReq{records: benchRec, hasBody: true, contentType: "text/plain"}, nil)
 	if !ok || resp.status != 204 {
 		b.Errorf("append %s: ok=%v status=%d", path, ok, resp.status)
 	}

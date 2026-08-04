@@ -6,8 +6,7 @@ import (
 )
 
 // StreamMeta is the mutable per-stream metadata stored under ktStreamMeta.
-// It is encoded with a stable hand-rolled binary format (never encoding/gob, per
-// SPEC.md §3).
+// It is encoded with a stable hand-rolled binary format, never encoding/gob.
 type StreamMeta struct {
 	StreamID    uint64
 	ContentType string
@@ -18,11 +17,12 @@ type StreamMeta struct {
 	IsPrivate   bool   // drives Cache-Control public vs private
 	Deadline    uint64 // unix seconds of the current expiry deadline in the index; 0 = none
 
-	// fork fields — immutable after creation (safe to read off the streamer
-	// goroutine). ForkedFrom is the source stream's id; the divergence point is
-	// the offset (ForkOffset seq, ForkByte). Live RefCount / soft-delete state
-	// live outside meta (a dedicated ktRefCount key and the PathTombstone) so
-	// their mutations never race the streamer's meta writes.
+	// These fork fields are immutable after creation, so they are safe to
+	// read off the streamer goroutine. ForkedFrom is the source stream's id.
+	// The divergence point is the offset (ForkOffset seq, ForkByte). Live
+	// RefCount and soft-delete state live outside meta, in a dedicated
+	// ktRefCount key and the PathTombstone, so their mutations never race
+	// the streamer's meta writes.
 	ForkedFrom uint64 // 0 = not a fork
 	ForkOffset uint64 // source seq at the divergence point
 	ForkByte   uint64 // byte within ForkOffset's record (binary sub-offset); 0 = boundary

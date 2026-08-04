@@ -40,7 +40,7 @@ func startServer(tb testing.TB, store Storage, cfg Config) (*httptest.Server, *S
 		tb.Fatalf("new server: %v", err)
 	}
 	ts := httptest.NewServer(srv)
-	tb.Cleanup(func() { ts.Close(); srv.Close() })
+	tb.Cleanup(func() { ts.Close(); _ = srv.Close() })
 	return ts, srv
 }
 
@@ -49,7 +49,7 @@ func startServer(tb testing.TB, store Storage, cfg Config) (*httptest.Server, *S
 // flush cadence, which the fake (instant durability) does not model.
 func newRealLiveServer(tb testing.TB, cfg Config, flush time.Duration) (*httptest.Server, *Server) {
 	tb.Helper()
-	store, err := OpenStore(uniqueDBPath("live"), "memory:///", flush)
+	store, err := OpenStore(uniqueDBPath("live"), "memory:///", StoreTuning{FlushInterval: flush})
 	if err != nil {
 		tb.Fatalf("open store: %v", err)
 	}
@@ -69,7 +69,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() {
 		ts.Close()
-		srv.Close()
+		_ = srv.Close()
 	})
 	return ts
 }

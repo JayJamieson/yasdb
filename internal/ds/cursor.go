@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-// Cursor collapsing parameters (protocol §10.1). Cursors are interval numbers
-// counted from a fixed epoch; echoing them as a query parameter gives CDNs a
-// changing cache key so waiters eventually break out of cached empty responses.
+// Cursor collapsing parameters (protocol §10.1). Cursors are interval
+// numbers counted from a fixed epoch. Echoing them as a query parameter
+// gives CDNs a changing cache key, so waiters eventually break out of
+// cached empty responses.
 var cursorEpoch = time.Date(2024, 10, 9, 0, 0, 0, 0, time.UTC)
 
 const cursorIntervalSecs = 20

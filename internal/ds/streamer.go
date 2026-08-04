@@ -6,13 +6,13 @@ import (
 	"time"
 )
 
-// dormancyTimeout is how long a streamer stays resident with no activity before
-// it exits and removes itself from the registry (SPEC.md §5, "Dormancy").
+// dormancyTimeout is how long a streamer stays resident with no activity
+// before it exits and removes itself from the registry.
 const dormancyTimeout = 60 * time.Second
 
-// appendReq is a mutation submitted to a streamer. All validation and the write
-// happen on the streamer goroutine, giving per-(stream,producerId) serialisation
-// for free (SPEC §5, protocol §5.2.1).
+// appendReq is a mutation submitted to a streamer. All validation and the
+// write happen on the streamer goroutine, which gives per-(stream,
+// producerId) serialisation for free.
 type appendReq struct {
 	records     [][]byte // record payloads (already JSON-flattened); empty for close-only
 	hasBody     bool
@@ -63,20 +63,23 @@ type streamer struct {
 	producerLoaded  map[string]bool
 	writerSeq       string
 	writerSeqLoaded bool
-	// writeTail is the writer-view tail: it advances as soon as a burst is
-	// planned (for seq assignment + validation continuity), running ahead of the
-	// reader-visible `tail` in notifier mode until the write is durable.
+	// writeTail is the writer-view tail. It advances as soon as a burst is
+	// planned (for seq assignment and validation continuity), running
+	// ahead of the reader-visible `tail` in notifier mode until the write
+	// is durable.
 	writeTail uint64
 
-	// pending counts in-flight durability callbacks (notifier mode); a streamer
-	// must not retire (and let a respawn read a stale durable tail) while > 0.
+	// pending counts in-flight durability callbacks (notifier mode). A
+	// streamer must not retire while this is > 0, or a respawn could read
+	// a stale durable tail.
 	pending atomic.Int64
 
 	// Shared, lock-free reader state.
-	tail    atomic.Uint64                 // next seq to assign / tail offset
-	closed  atomic.Bool                   // cached closure flag
-	readers atomic.Int64                  // parked live readers (long-poll/SSE)
-	waiters atomic.Pointer[chan struct{}] // broadcast channel; closed on commit
+	tail            atomic.Uint64                 // next seq to assign / tail offset
+	closed          atomic.Bool                   // cached closure flag
+	longPollReaders atomic.Int64                  // parked long-poll readers
+	sseReaders      atomic.Int64                  // parked SSE readers
+	waiters         atomic.Pointer[chan struct{}] // broadcast channel; closed on commit
 
 	waker     *liveWaker   // coalesces commit wakeups (see livewaker.go)
 	wakeCount atomic.Int64 // broadcasts fired (observability / bench)
@@ -95,7 +98,7 @@ func newStreamer(srv *Server, path string, meta *StreamMeta, tailSeq uint64) *st
 		isJSON:         isJSONStream(meta.ContentType),
 		forkedFrom:     meta.ForkedFrom,
 		forkOffset:     meta.ForkOffset,
-		reqs:           make(chan appendReq, 64),
+		reqs:           make(chan appendReq, maxBurst),
 		touch:          make(chan struct{}, 1),
 		stop:           make(chan struct{}),
 		meta:           meta,
@@ -109,9 +112,10 @@ func newStreamer(srv *Server, path string, meta *StreamMeta, tailSeq uint64) *st
 	ch := make(chan struct{})
 	s.waiters.Store(&ch)
 	s.waker = newLiveWaker(s, srv.cfg.LiveCoalesceWindow)
-	// Forks read by stitching inherited source segments (resolveSegments); the
-	// in-memory record cache serves only a stream's own contiguous tail, so it is
-	// enabled for non-fork streams and forks stay on the readRange path.
+	// Forks read by stitching inherited source segments (resolveSegments).
+	// The in-memory record cache serves only a stream's own contiguous
+	// tail, so it is enabled for non-fork streams, and forks stay on the
+	// readRange path.
 	if meta.ForkedFrom == 0 && !srv.cfg.DisableLiveCache {
 		s.cache = newLiveCache(srv.cfg.LiveCacheMaxRecords, srv.cfg.LiveCacheMaxBytes)
 	}
@@ -126,8 +130,8 @@ func (s *streamer) run() {
 	for {
 		select {
 		case req := <-s.reqs:
-			// Group commit: fold any already-queued appends into this one so a
-			// burst shares a single durability round-trip (SPEC §5 pipelining).
+			// Group commit: fold any already-queued appends into this one,
+			// so a burst shares a single durability round-trip.
 			s.processBurst(s.drainBurst(req))
 			if !timer.Stop() {
 				select {
@@ -151,8 +155,8 @@ func (s *streamer) run() {
 			}
 			timer.Reset(idle)
 		case <-s.stop:
-			// Streamer was force-retired (e.g. delete). Answer anything that
-			// raced into the buffer so no handler hangs.
+			// The streamer was force-retired (e.g. delete). Answer
+			// anything that raced into the buffer, so no handler hangs.
 			s.waker.stop()
 			for {
 				select {
@@ -166,13 +170,13 @@ func (s *streamer) run() {
 	}
 }
 
-// tryRetire removes the streamer from the registry after idle timeout. It aborts
-// if work is pending. Once it marks the streamer dead under mu, no enqueue can
-// race in: submit() checks dead under the same lock.
+// tryRetire removes the streamer from the registry after idle timeout. It
+// aborts if work is pending. Once it marks the streamer dead under mu, no
+// enqueue can race in: submit() checks dead under the same lock.
 func (s *streamer) tryRetire() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.reqs) > 0 || s.readers.Load() > 0 || s.pending.Load() > 0 {
+	if len(s.reqs) > 0 || s.totalReaders() > 0 || s.pending.Load() > 0 {
 		return false
 	}
 	s.srv.unregister(s)
@@ -181,13 +185,20 @@ func (s *streamer) tryRetire() bool {
 	return true
 }
 
-// waiterChan returns the current broadcast channel; it is closed when the next
-// commit lands, waking readers parked in select.
+// waiterChan returns the current broadcast channel. It is closed when the
+// next commit lands, waking readers parked in select.
 func (s *streamer) waiterChan() <-chan struct{} { return *s.waiters.Load() }
 
+// totalReaders returns the number of parked live readers across both
+// long-poll and SSE, for call sites that only care whether any are
+// present.
+func (s *streamer) totalReaders() int64 {
+	return s.longPollReaders.Load() + s.sseReaders.Load()
+}
+
 // stopped reports whether the streamer has been force-retired (deletion or
-// shutdown). Live reads check this before serving scanned records so they never
-// hand back data for a stream whose deletion has begun.
+// shutdown). Live reads check this before serving scanned records, so they
+// never hand back data for a stream whose deletion has begun.
 func (s *streamer) stopped() bool {
 	select {
 	case <-s.stop:
@@ -197,9 +208,10 @@ func (s *streamer) stopped() bool {
 	}
 }
 
-// broadcast publishes a fresh waiter channel and closes the previous one, waking
-// every parked reader. Routed through s.waker (see applyReader), which may
-// coalesce a burst of commits into fewer broadcasts.
+// broadcast publishes a fresh waiter channel and closes the previous one,
+// waking every parked reader. This is routed through s.waker (see
+// applyReader), which may coalesce a burst of commits into fewer
+// broadcasts.
 func (s *streamer) broadcast() {
 	next := make(chan struct{})
 	old := s.waiters.Swap(&next)
@@ -208,8 +220,9 @@ func (s *streamer) broadcast() {
 }
 
 // cacheRead tries to assemble a live read from the in-memory record cache,
-// avoiding a store scan. ok=false means the caller must fall back to readRange
-// (no cache, a fork, behind the retained window, or a case the cache won't serve).
+// avoiding a store scan. ok=false means the caller must fall back to
+// readRange: no cache, a fork, behind the retained window, or a case the
+// cache will not serve.
 func (s *streamer) cacheRead(dst []byte, isJSON bool, start Offset, tailSeq, limit uint64) (body []byte, next Offset, upToDate, ok bool) {
 	if s.cache == nil {
 		return nil, start, false, false
@@ -217,12 +230,13 @@ func (s *streamer) cacheRead(dst []byte, isJSON bool, start Offset, tailSeq, lim
 	return s.cache.tryRead(dst, isJSON, start, tailSeq, limit)
 }
 
-// ttlRefreshOps returns the batch ops that slide this stream's TTL deadline
-// forward, mutating the cached meta.Deadline. It returns nil when there is no
-// sliding TTL or a rewrite is not yet due (rate-limited to one write per
-// granularity window). Only sliding TTL is refreshed; Stream-Expires-At is
-// absolute. The written deadline is padded past now+TTL so the stream never
-// expires early despite sub-second truncation.
+// ttlRefreshOps returns the batch ops that slide this stream's TTL
+// deadline forward, mutating the cached meta.Deadline. It returns nil when
+// there is no sliding TTL, or a rewrite is not yet due (rate-limited to one
+// write per granularity window). Only sliding TTL is refreshed;
+// Stream-Expires-At is absolute. The written deadline is padded past
+// now+TTL, so the stream never expires early despite sub-second
+// truncation.
 func (s *streamer) ttlRefreshOps(nowUnix int64) []Op {
 	if s.meta.TTLSeconds == 0 {
 		return nil
@@ -246,9 +260,9 @@ func (s *streamer) ttlRefreshOps(nowUnix int64) []Op {
 	return ops
 }
 
-// refreshTTLOnRead slides the TTL forward for a read (best-effort, non-durable —
-// a lost refresh only shortens the window slightly). Runs on the streamer
-// goroutine so meta stays single-writer.
+// refreshTTLOnRead slides the TTL forward for a read. This is best-effort
+// and non-durable: a lost refresh only shortens the window slightly. It
+// runs on the streamer goroutine, so meta stays single-writer.
 func (s *streamer) refreshTTLOnRead() {
 	old := s.meta.Deadline
 	ops := s.ttlRefreshOps(time.Now().Unix())
@@ -291,8 +305,20 @@ func (s *streamer) loadWriterSeq() string {
 	return s.writerSeq
 }
 
-// maxBurst bounds how many queued appends fold into one group commit.
-const maxBurst = 64
+// maxBurst bounds how many queued appends fold into one group commit, and
+// sizes the reqs channel buffer (newStreamer). The two move together, since
+// drainBurst can never see more than the channel holds. This caps only
+// yasdb's own per-stream batching, and is unrelated to SlateDB's own WAL
+// flush cadence.
+//
+// This is a PER-STREAM allocation made unconditionally at spawn, so it
+// must be sized for resident-stream COUNT, not single-stream throughput.
+// appendReq is 80 bytes, and raising this to 4096 once, safe for one hot
+// stream, meant 10 GiB of channel buffer at 32768 resident streams: more
+// than an 8GB box has. 512 keeps most of the single-stream win at about
+// 1/8th the memory. Check size × max-realistic-resident-count before
+// raising this.
+const maxBurst = 512
 
 // drainBurst collects `first` plus any already-queued appends (non-blocking).
 func (s *streamer) drainBurst(first appendReq) []appendReq {
@@ -308,9 +334,10 @@ func (s *streamer) drainBurst(first appendReq) []appendReq {
 	return batch
 }
 
-// pendingBurst accumulates the in-memory effects of a burst of appends before a
-// single atomic durable commit. Committed state is only mutated after the commit
-// succeeds, so a failed commit needs no rollback — the pending view is dropped.
+// pendingBurst accumulates the in-memory effects of a burst of appends
+// before a single atomic durable commit. Committed state is only mutated
+// after the commit succeeds, so a failed commit needs no rollback: the
+// pending view is just dropped.
 type pendingBurst struct {
 	tail      uint64
 	closed    bool
@@ -321,9 +348,10 @@ type pendingBurst struct {
 	now       int64
 }
 
-// processBurst validates each append in order against a shared pending view,
-// then lands all accepted effects in one atomic durable WriteBatch. Validation
-// stays per-(stream,producerId) serialised because it all runs on this goroutine.
+// processBurst validates each append in order against a shared pending
+// view, then lands all accepted effects in one atomic durable WriteBatch.
+// Validation stays per-(stream,producerId) serialised, because it all runs
+// on this goroutine.
 func (s *streamer) processBurst(batch []appendReq) {
 	baseSeq := s.writeTail // seq of the first record this burst assigns
 	pend := &pendingBurst{
@@ -377,13 +405,14 @@ func (s *streamer) processBurst(batch []appendReq) {
 		ops = append(ops, Op{Key: metaKey(s.path), Val: m.Marshal()})
 	}
 
-	// Capture the run of record payloads for the live cache (non-fork streams with
-	// live readers). pend.recordOps holds only record ops, contiguous ascending
-	// from baseSeq. Skipped when no readers are parked, so a pure-write stream pays
-	// nothing; a reader that connects mid-burst just misses this once and falls
-	// back to the store.
+	// Capture the run of record payloads for the live cache (non-fork
+	// streams with live readers). pend.recordOps holds only record ops,
+	// contiguous ascending from baseSeq. This is skipped when no readers
+	// are parked, so a pure-write stream pays nothing. A reader that
+	// connects mid-burst just misses this once, and falls back to the
+	// store.
 	var seg cacheSeg
-	if s.cache != nil && len(pend.recordOps) > 0 && s.readers.Load() > 0 {
+	if s.cache != nil && len(pend.recordOps) > 0 && s.totalReaders() > 0 {
 		seg.firstSeq = baseSeq
 		seg.payloads = make([][]byte, len(pend.recordOps))
 		for i, op := range pend.recordOps {
@@ -397,8 +426,8 @@ func (s *streamer) processBurst(batch []appendReq) {
 	})
 }
 
-// cacheSeg is the contiguous run of record payloads a burst committed, handed to
-// the live cache when the reader-visible tail advances.
+// cacheSeg is the contiguous run of record payloads a burst committed. It
+// is handed to the live cache when the reader-visible tail advances.
 type cacheSeg struct {
 	firstSeq uint64
 	payloads [][]byte
@@ -421,15 +450,17 @@ func (s *streamer) applyWriter(pend *pendingBurst, metaChanged bool) {
 	}
 }
 
-// applyReader publishes the reader-visible state (tail, closure) and wakes live
-// readers. In notifier mode this runs on the notifier goroutine once the write
-// is durable; all fields it touches are atomics / the broadcast pointer.
+// applyReader publishes the reader-visible state (tail, closure) and wakes
+// live readers. In notifier mode this runs on the notifier goroutine once
+// the write is durable. All fields it touches are atomics or the broadcast
+// pointer.
 func (s *streamer) applyReader(tail uint64, closed bool, seg cacheSeg) {
-	// Populate the cache before publishing the tail so any reader that observes the
-	// new tail finds the records in RAM. Only cache while readers are present; drop
-	// the window otherwise so write-only streams cost nothing.
+	// Populate the cache before publishing the tail, so any reader that
+	// observes the new tail finds the records in RAM. Only cache while
+	// readers are present; drop the window otherwise, so write-only
+	// streams cost nothing.
 	if s.cache != nil {
-		if s.readers.Load() > 0 {
+		if s.totalReaders() > 0 {
 			s.cache.append(seg.firstSeq, seg.payloads)
 		} else {
 			s.cache.reset()
@@ -439,7 +470,14 @@ func (s *streamer) applyReader(tail uint64, closed bool, seg cacheSeg) {
 	if closed {
 		s.closed.Store(true)
 	}
-	s.waker.Wake()
+	// Same reasoning as the cache gate above: waking zero parked readers
+	// costs a channel allocation (broadcast) or a timer arm for nothing. A
+	// reader that connects mid-burst reads st.tail fresh before parking,
+	// so it never misses data; it only needs a subsequent commit's wake,
+	// once it is counted.
+	if s.totalReaders() > 0 {
+		s.waker.Wake()
+	}
 }
 
 func replyAll(batch []appendReq, responses []appendResp) {
@@ -477,7 +515,7 @@ func (s *streamer) effWriterSeq(pend *pendingBurst) string {
 // planAppend validates one append against the pending view and, when accepted,
 // records its effects into that view. It never touches committed state.
 func (s *streamer) planAppend(pend *pendingBurst, req appendReq) (appendResp, bool) {
-	// 1. Closed status has the highest precedence (SPEC §8, protocol §5.2).
+	// 1. Closed status has the highest precedence.
 	if pend.closed {
 		return s.planAppendClosed(pend, req)
 	}
@@ -511,7 +549,7 @@ func (s *streamer) planAppend(pend *pendingBurst, req appendReq) (appendResp, bo
 	}
 	// 3b. Stream-Seq must be strictly increasing (per-stream scope).
 	if req.streamSeq != nil {
-		if !(*req.streamSeq > s.effWriterSeq(pend)) {
+		if *req.streamSeq <= s.effWriterSeq(pend) {
 			return appendResp{status: 409}, false
 		}
 	}

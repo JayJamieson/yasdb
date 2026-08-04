@@ -1,0 +1,57 @@
+name: Release
+
+# Tag push drives the version: goreleaser reads it from the git tag (must be
+# a valid semver, e.g. v1.2.3) and injects it into the binary via ldflags
+# (main.version — see main.go's -version flag) and into the GitHub Release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, so goreleaser can build the changelog
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: docker image
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Hardcoded lowercase: GHCR image refs must be all-lowercase, and
+          # github.repository preserves the repo's actual casing.
+          tags: |
+            ghcr.io/jayjamieson/yasdb:${{ github.ref_name }}
+            ghcr.io/jayjamieson/yasdb:latest

@@ -1,0 +1,31 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+  settings:
+    errcheck:
+      # This codebase has an established idiom of ignoring errors from
+      # response writes and close calls whose failure is either already
+      # observed elsewhere (e.g. an iterator's Next()) or inconsequential
+      # (a client that went away). These excludes keep errcheck useful for
+      # everything else instead of drowning in that idiom.
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*encoding/json.Encoder).Encode
+        - io.Copy
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

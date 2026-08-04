@@ -12,16 +12,17 @@ import (
 )
 
 // TestProbeReadAfterAck asserts read-after-acknowledge consistency in each
-// durability mode. It is a direct probe (no linearizability checker): after an
-// append is ACKed at offset N (to any client), a strictly-subsequent read must
-// observe at least N records.
+// durability mode. It is a direct probe, not a linearizability checker:
+// after an append is acknowledged at offset N (to any client), a
+// strictly-subsequent read must observe at least N records.
 //
-// This is the regression test for a real bug (fixed 2026-07-29): under concurrent
-// pipelining, notifier mode published the reader-visible tail out of order,
-// letting a read observe fewer records than an offset already acked. The cause
-// was durabilityNotifier.subscribe firing an already-durable callback on the
-// caller's goroutine, racing the poller firing an earlier burst; the fix routes
-// every callback through the single poller goroutine so applyReader stays ordered.
+// This is the regression test for a real bug (fixed 2026-07-29): under
+// concurrent pipelining, notifier mode published the reader-visible tail
+// out of order, letting a read observe fewer records than an offset
+// already acknowledged. The cause was durabilityNotifier.subscribe firing
+// an already-durable callback on the caller's goroutine, racing the poller
+// firing an earlier burst. The fix routes every callback through the
+// single poller goroutine, so applyReader stays ordered.
 func TestProbeReadAfterAck(t *testing.T) {
 	if testing.Short() {
 		t.Skip("read-after-ack probe skipped in -short")
@@ -111,7 +112,7 @@ func TestProbeReadAfterAck(t *testing.T) {
 
 func mustMemStore(t *testing.T) Storage {
 	t.Helper()
-	store, err := OpenStore(uniqueDBPath("probe"), "memory:///", 5*time.Millisecond)
+	store, err := OpenStore(uniqueDBPath("probe"), "memory:///", StoreTuning{FlushInterval: 5 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
