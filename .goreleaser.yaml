@@ -52,7 +52,7 @@ release:
     ## Docker image
 
     ```
-    docker pull ghcr.io/jayjamieson/yasdb:{{ .Tag }}
+    docker pull jayjamieson/yasdb:{{ .Tag }}
     ```
 
     See [`docs/DEPLOY.md`](https://github.com/JayJamieson/yasdb/blob/{{ .Tag }}/docs/DEPLOY.md)

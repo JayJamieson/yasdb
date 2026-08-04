@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
   goreleaser:
@@ -42,16 +41,13 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # Hardcoded lowercase: GHCR image refs must be all-lowercase, and
-          # github.repository preserves the repo's actual casing.
           tags: |
-            ghcr.io/jayjamieson/yasdb:${{ github.ref_name }}
-            ghcr.io/jayjamieson/yasdb:latest
+            jayjamieson/yasdb:${{ github.ref_name }}
+            jayjamieson/yasdb:latest
