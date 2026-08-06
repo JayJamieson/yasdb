@@ -472,45 +472,46 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, path string)
 // --- DELETE ---
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
+	switch err := s.deleteStream(path); {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, ErrGone):
+		http.Error(w, "stream gone", http.StatusGone)
+	case errors.Is(err, ErrNotFound):
+		http.Error(w, "stream not found", http.StatusNotFound)
+	default:
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+
+// deleteStream implements DELETE's semantics: a stream with outstanding
+// forks is soft-deleted (retains data for fork readers, serves ErrGone on
+// its own path from then on); otherwise it is hard-deleted. Shared by
+// handleDelete and the public Server.DeleteStream.
+func (s *Server) deleteStream(path string) error {
 	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
 
 	if reason, _, found, err := s.loadTombstone(path); err != nil {
-		s.metaMu.Unlock()
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return err
 	} else if found && reason == tombSoftDelete {
-		s.metaMu.Unlock()
-		http.Error(w, "stream gone", http.StatusGone)
-		return
+		return ErrGone
 	}
 
 	meta, ok, err := s.loadMeta(path)
 	if err != nil {
-		s.metaMu.Unlock()
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return err
 	}
 	if !ok {
-		s.metaMu.Unlock()
-		http.Error(w, "stream not found", http.StatusNotFound)
-		return
+		return ErrNotFound
 	}
 
 	// A stream with outstanding forks is soft-deleted (retains data for fork
 	// readers, serves 410 on its own path); otherwise it is hard-deleted.
-	var derr error
 	if s.loadRefCount(meta.StreamID) > 0 {
-		derr = s.softDeleteLocked(path, meta)
-	} else {
-		derr = s.deleteStreamLocked(path, meta)
+		return s.softDeleteLocked(path, meta)
 	}
-	if derr != nil {
-		s.metaMu.Unlock()
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	s.metaMu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
+	return s.deleteStreamLocked(path, meta)
 }
 
 // --- request parsing helpers ---

@@ -15,7 +15,7 @@ import (
 // that DurableSeq immediately reflects, exercising the notifier durability
 // path without real flush latency.
 //
-// Set YASDB_TEST_BACKEND=slatedb to run the same suite against the real store.
+// Set YASDB_TEST_BACKEND=slatedb|pwal to run the same suite against a real store.
 type fakeStore struct {
 	mu     sync.Mutex
 	data   map[string][]byte

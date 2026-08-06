@@ -13,10 +13,14 @@
 # Local data directory created by the server
 /yasdb-data/
 
-# Maelstrom test store (results/logs) and stray built binaries
+# Maelstrom test store (results/logs) and stray built binaries. The /yasdb
+# rule matches the built binary at repo root; negated for the yasdb/
+# package directory (github.com/JayJamieson/yasdb/yasdb), which is source,
+# not a build artifact.
 /store/
 /maelstrom-adapter
 /yasdb
+!/yasdb/
 
 # k6 load-test run artifacts (summaries + metric dumps)
 /k6/results/
