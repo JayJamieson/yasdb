@@ -1,9 +1,6 @@
 package ds
 
-import (
-	"runtime"
-	"sync"
-)
+import "sync"
 
 // committer lands an assembled append burst durably and arranges the
 // reader-visible publish and the client replies. Both modes return
@@ -53,15 +50,17 @@ func (sc syncCommitter) commit(st *streamer, c commitBurst) {
 func (syncCommitter) close() error { return nil }
 
 // defaultCommitterBatchMax bounds how many different streams' bursts one
-// committer worker folds into a single WriteBatch — distinct from maxBurst,
-// which bounds one stream's own queued requests. See
-// docs/rfcs/0001-cross-stream-group-commit.md.
+// physical CommitAsync call folds together — distinct from maxBurst, which
+// bounds one stream's own queued requests. It exists to cap one commit's
+// size (memory, and latency for whoever's waiting on it) under extreme
+// fan-out, not for throughput: see RFC 0001 for why a single shared queue
+// with this cap outperforms nothing on this dimension.
 const defaultCommitterBatchMax = 512
 
-// commitJob is one streamer's already-planned burst, handed to a
-// sharedCommitter worker. applyWriter has already run by the time a job
-// reaches a worker, so a worker only ever does I/O — no streamer-owned state
-// is touched off the streamer's own goroutine.
+// commitJob is one streamer's already-planned burst, handed to the shared
+// committer. applyWriter has already run by the time a job is queued, so
+// the committer only ever does I/O — no streamer-owned state is touched
+// off the streamer's own goroutine.
 type commitJob struct {
 	st           *streamer
 	c            commitBurst
@@ -75,95 +74,61 @@ func failJob(j commitJob, err error) {
 	j.st.pending.Add(-1)
 }
 
-// sharedCommitter is the notifier-durability committer (RFC 0001). It is a
-// small GOMAXPROCS-sized pool of workers. Instead of one CommitAsync call
-// per stream's own burst, each worker coalesces bursts from whichever
-// streams land in its queue into one shared WriteBatch. Throughput then
-// scales with total system load, not per-stream concurrency.
+// sharedCommitter is the notifier-durability committer (RFC 0001): a
+// single shared commit queue, not a worker pool. Every commit()'d job
+// (from however many different streams) lands in one mutex-guarded
+// pending slice; whichever caller finds no flush already running takes up
+// to batchMax of it and runs the physical CommitAsync, looping onto
+// whatever staged while that call was in flight (the same "stage while a
+// flush is in progress, then loop" discipline pwalShard.stage/runFlush
+// uses elsewhere in this package). Every stream gets one strict
+// process-wide commit order for free this way — there is only ever one
+// physical commit in flight, so two bursts can never reach CommitAsync out
+// of order regardless of which streams they came from, and no hash-routing
+// is needed to prevent it.
 //
-// A stream is always routed to the same worker (hash by id), so that
-// worker's single-goroutine FIFO drain preserves the ordering
-// durabilityNotifier depends on: CommitAsync calls for one stream must
-// reach SlateDB in the order that stream produced them, since fire() sorts
-// callbacks by SlateDB's own returned sequence number, not call order (see
-// durability.go). Different streams have no ordering relationship to each
-// other, so folding them into one WriteBatch is always safe.
+// An earlier design used a GOMAXPROCS-sized worker pool with streams
+// hash-routed to a fixed worker, on the theory that spreading physical
+// CommitAsync calls across workers would matter for cross-stream
+// throughput. RFC 0001 measured both, in a sandbox and then for real
+// against production Fly.io hardware: the worker pool showed a real,
+// reproducible ~15% edge in an in-memory-store sandbox, and no measurable
+// edge at all against a real volume-backed store on real hardware — the
+// engine's own durability I/O dominates enough there that how many Go-side
+// callers feed it stops mattering. This design won on real hardware and
+// deleted the worker pool, the hash function, and the N-way shutdown
+// coordination that came with it.
 type sharedCommitter struct {
 	store    Storage
 	notifier *durabilityNotifier
-	workers  []*committerWorker
+	batchMax int
 	wg       sync.WaitGroup
-}
 
-// committerWorker owns one commit queue. mu and closed make "check
-// not-closed, then enqueue" (commit) atomic with "mark closed, then close
-// the channel" (close). This is the same race durabilityNotifier.subscribe
-// already guards against (see its doc comment). Without that, a job could
-// land in a channel a worker already stopped draining, and never resolve.
-// This uses one mutex per worker, not one global mutex, so only jobs routed
-// to the same worker ever contend.
-type committerWorker struct {
-	mu     sync.Mutex
-	closed bool
-	in     chan commitJob
+	mu       sync.Mutex
+	pending  []commitJob
+	flushing bool
+	closed   bool
 }
 
 func newSharedCommitter(store Storage, cfg Config) *sharedCommitter {
-	n := cfg.CommitterWorkers
-	if n <= 0 {
-		n = runtime.GOMAXPROCS(0)
-	}
-	if n < 1 {
-		n = 1
-	}
 	batchMax := cfg.CommitterBatchMax
 	if batchMax <= 0 {
 		batchMax = defaultCommitterBatchMax
 	}
-
-	sc := &sharedCommitter{
+	return &sharedCommitter{
 		store:    store,
 		notifier: newDurabilityNotifier(store, cfg.NotifierPollInterval),
-		workers:  make([]*committerWorker, n),
+		batchMax: batchMax,
 	}
-	for i := range sc.workers {
-		w := &committerWorker{in: make(chan commitJob, batchMax)}
-		sc.workers[i] = w
-		sc.wg.Add(1)
-		go func() {
-			defer sc.wg.Done()
-			sc.runWorker(w, batchMax)
-		}()
-	}
-	return sc
-}
-
-// fnv1aU64 hashes a uint64 with zero allocation, mirroring registry.go's
-// fnv1a (which hashes a string path instead).
-func fnv1aU64(id uint64) uint32 {
-	const (
-		offset32 = 2166136261
-		prime32  = 16777619
-	)
-	h := uint32(offset32)
-	for i := 0; i < 8; i++ {
-		h ^= uint32(byte(id >> (8 * i)))
-		h *= prime32
-	}
-	return h
-}
-
-func (sc *sharedCommitter) workerFor(streamID uint64) *committerWorker {
-	return sc.workers[fnv1aU64(streamID)%uint32(len(sc.workers))]
 }
 
 // commit does the Go-side bookkeeping synchronously on the streamer's own
 // goroutine. applyWriter must run before this returns, since the next
 // burst's baseSeq is read from st.writeTail immediately after. Only the
 // actual CommitAsync call and durability tracking are expensive I/O, so
-// only that part is handed to a worker.
+// only that part runs on the flush goroutine.
 //
-// applyWriter runs even on the path that ends in failJob (the worker is
+// applyWriter runs even on the path that ends in failJob (the committer is
 // already closed, i.e. Server.Close). This is harmless: this streamer's
 // state is about to be discarded, and applyReader (the reader-visible
 // publish) never runs for a failed job.
@@ -181,90 +146,99 @@ func (sc *sharedCommitter) commit(st *streamer, c commitBurst) {
 	// durable tail.
 	st.pending.Add(1)
 
-	w := sc.workerFor(st.id)
-	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
+	sc.mu.Lock()
+	if sc.closed {
+		sc.mu.Unlock()
 		failJob(job, errStoreClosed)
 		return
 	}
-	w.in <- job
-	w.mu.Unlock()
-}
-
-// runWorker drains its queue, folding whatever jobs are already waiting,
-// from any stream, into one CommitAsync call, up to batchMax. All jobs in
-// one call share a SlateDB sequence number, which is fine: subscribe is
-// called per job in drain order (FIFO), and equal-target subscribers fire
-// in that same order (subscribe's tie-breaking). So two jobs for the same
-// stream still resolve in submission order.
-//
-// Ranging over w.in is safe until close: shutdown only closes it under
-// w.mu, the same lock commit() checks before sending. So nothing lands
-// after this loop sees it close.
-func (sc *sharedCommitter) runWorker(w *committerWorker, batchMax int) {
-	for job := range w.in {
-		sc.processBatch(w, job, batchMax)
-	}
-}
-
-func (sc *sharedCommitter) processBatch(w *committerWorker, first commitJob, batchMax int) {
-	// This grows from a small guess. It is not pre-allocated at batchMax:
-	// pprof at 32768 streams found that pre-allocating 512 commitJobs on
-	// every call, regardless of how many actually arrived, spent 18%+ of
-	// total CPU zeroing unused slots on the common case of a batch of 1-2.
-	jobs := make([]commitJob, 1, 8)
-	jobs[0] = first
-	for len(jobs) < batchMax {
-		select {
-		case j := <-w.in:
-			jobs = append(jobs, j)
-		default:
-			goto commit
-		}
-	}
-commit:
-	totalOps := 0
-	for _, j := range jobs {
-		totalOps += len(j.c.ops)
-	}
-	ops := make([]Op, 0, totalOps)
-	for _, j := range jobs {
-		ops = append(ops, j.c.ops...)
-	}
-	seq, err := sc.store.CommitAsync(ops)
-	if err != nil {
-		for _, j := range jobs {
-			failJob(j, err)
-		}
+	sc.pending = append(sc.pending, job)
+	if sc.flushing {
+		sc.mu.Unlock()
 		return
 	}
-	for _, j := range jobs {
-		sc.notifier.subscribe(seq, func(cerr error) {
-			if cerr == nil {
-				j.st.applyReader(j.targetTail, j.targetClosed, j.c.seg)
-			} else {
-				failAccepted(j.c.batch, j.c.responses, j.c.accepted, cerr)
+	sc.flushing = true
+	batch := sc.takeBatchLocked()
+	sc.wg.Add(1)
+	sc.mu.Unlock()
+	go sc.runFlush(batch)
+}
+
+// takeBatchLocked removes up to batchMax jobs from the front of sc.pending
+// and returns them, leaving any excess still queued for the next loop
+// iteration in runFlush. Must be called with sc.mu held.
+func (sc *sharedCommitter) takeBatchLocked() []commitJob {
+	if len(sc.pending) <= sc.batchMax {
+		batch := sc.pending
+		sc.pending = nil
+		return batch
+	}
+	batch := append([]commitJob(nil), sc.pending[:sc.batchMax]...)
+	sc.pending = sc.pending[sc.batchMax:]
+	return batch
+}
+
+// runFlush folds jobs (from however many different streams contributed
+// them) into one CommitAsync call, subscribes each to the durability
+// notifier under the returned seq — subscribe is called per job in drain
+// order, and equal-target subscribers fire in that same order (subscribe's
+// tie-breaking), so two jobs for the same stream still resolve in
+// submission order — then loops onto whatever staged while that call was
+// in flight. Exits (and releases wg) once the queue is empty.
+func (sc *sharedCommitter) runFlush(jobs []commitJob) {
+	defer sc.wg.Done()
+	for {
+		totalOps := 0
+		for _, j := range jobs {
+			totalOps += len(j.c.ops)
+		}
+		ops := make([]Op, 0, totalOps)
+		for _, j := range jobs {
+			ops = append(ops, j.c.ops...)
+		}
+		seq, err := sc.store.CommitAsync(ops)
+		if err != nil {
+			for _, j := range jobs {
+				failJob(j, err)
 			}
-			replyAll(j.c.batch, j.c.responses)
-			j.st.pending.Add(-1)
-		})
+		} else {
+			for _, j := range jobs {
+				j := j
+				sc.notifier.subscribe(seq, func(cerr error) {
+					if cerr == nil {
+						j.st.applyReader(j.targetTail, j.targetClosed, j.c.seg)
+					} else {
+						failAccepted(j.c.batch, j.c.responses, j.c.accepted, cerr)
+					}
+					replyAll(j.c.batch, j.c.responses)
+					j.st.pending.Add(-1)
+				})
+			}
+		}
+
+		sc.mu.Lock()
+		if len(sc.pending) == 0 {
+			sc.flushing = false
+			sc.mu.Unlock()
+			return
+		}
+		jobs = sc.takeBatchLocked()
+		sc.mu.Unlock()
 	}
 }
 
 func (sc *sharedCommitter) close() error {
-	// Mark closed and close the channel under the same mutex commit() checks
-	// before sending. No send can land after close (see committerWorker's
-	// doc comment).
-	for _, w := range sc.workers {
-		w.mu.Lock()
-		w.closed = true
-		close(w.in)
-		w.mu.Unlock()
+	sc.mu.Lock()
+	sc.closed = true
+	stray := sc.pending
+	sc.pending = nil
+	sc.mu.Unlock()
+	for _, j := range stray {
+		failJob(j, errStoreClosed)
 	}
-	// Wait for every worker to drain and exit before the notifier shuts
-	// down, and, more importantly, before Server.Close frees the native
-	// store handle a worker might still be calling into.
+	// Wait for any in-flight runFlush to finish before the notifier shuts
+	// down, and before Server.Close frees the native store handle it might
+	// still be calling into.
 	sc.wg.Wait()
 	sc.notifier.shutdown()
 	return nil

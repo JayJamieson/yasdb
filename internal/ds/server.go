@@ -84,15 +84,13 @@ type Config struct {
 	Durability           string
 	NotifierPollInterval time.Duration // durable-seq poll interval (notifier mode)
 
-	// CommitterWorkers sizes the shared committer pool (notifier mode only
-	// — see commit.go's sharedCommitter, RFC 0001). 0 means:
-	// runtime.GOMAXPROCS(0). A committer is a goroutine that does real
-	// CommitAsync work, unlike a registry shard (just a mutex and a map).
-	// More of them means smaller batches per committer, so this should
-	// track core count, not stream count.
-	CommitterWorkers int
 	// CommitterBatchMax bounds how many different streams' bursts one
-	// committer folds into a single WriteBatch. 0 = defaultCommitterBatchMax.
+	// physical CommitAsync call folds together (notifier mode only — see
+	// commit.go's sharedCommitter, RFC 0001). 0 = defaultCommitterBatchMax.
+	// This caps one commit's size under extreme fan-out; it is not a
+	// concurrency knob (the committer is a single shared queue, not a
+	// worker pool — RFC 0001 measured a worker pool per stream-hash bucket
+	// against this and found no throughput edge on real hardware).
 	CommitterBatchMax int
 }
 

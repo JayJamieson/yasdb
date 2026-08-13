@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/JayJamieson/yasdb/internal/ds"
+	"github.com/JayJamieson/yasdb/yasdb"
+	"github.com/JayJamieson/yasdb/yasdb/httpapi"
 )
 
 // version, commit, and date are set at build time via -ldflags (see
@@ -54,8 +56,7 @@ func main() {
 	pprofBlockRate := flag.Int("pprof-block-rate", 0, "runtime.SetBlockProfileRate in nanoseconds (1 = profile every blocking event); 0 = off. Mounts net/http/pprof on -metrics-addr when this or -pprof-mutex-fraction is set. Investigative use only; adds real overhead when nonzero.")
 	pprofMutexFraction := flag.Int("pprof-mutex-fraction", 0, "runtime.SetMutexProfileFraction (1 = sample every mutex contention event); 0 = off. See -pprof-block-rate.")
 	adminBulkProvision := flag.Bool("admin-bulk-provision", false, "mount POST /__admin/bulk-provision on -metrics-addr (private-network-only). Creates many empty streams in a few batched Commit calls, instead of one HTTP request per stream, for fast load-test setup. Off by default: it is a mutating, storage-filling operation.")
-	committerWorkers := flag.Int("committer-workers", 0, "shared committer pool size in -durability notifier mode (see docs/rfcs/0001-cross-stream-group-commit.md); 0 = GOMAXPROCS")
-	committerBatchMax := flag.Int("committer-batch-max", 0, "max number of different streams' bursts one committer folds into a single WriteBatch; 0 = engine default (512)")
+	committerBatchMax := flag.Int("committer-batch-max", 0, "max number of different streams' bursts one commit folds into a single WriteBatch, in -durability notifier mode (see docs/rfcs/0001-cross-stream-group-commit.md); 0 = engine default (512)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -98,37 +99,25 @@ func main() {
 			log.Fatalf("open store: %v", err)
 		}
 	}
-	srv, err := ds.NewServer(store, ds.Config{
+	db, err := yasdb.Open(store, yasdb.Config{
 		Durability:           *durability,
 		NotifierPollInterval: *pollInterval,
 		LiveCoalesceWindow:   defaultLiveCoalesceWindow,
 		LongPollTimeout:      *longPollTimeout,
-		CommitterWorkers:     *committerWorkers,
 		CommitterBatchMax:    *committerBatchMax,
 	})
 	if err != nil {
 		log.Fatalf("start server: %v", err)
 	}
+	// srv is the underlying *internal/ds.Server: main.go stays in-module,
+	// so it can still reach the ds-level operational surfaces (metrics,
+	// bulk-provision) that RFC 0002 deliberately keeps out of the small
+	// embeddable core (see docs/rfcs/0002-embeddable-library-api.md).
+	srv := db.Server()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Liveness/readiness probe (see fly.toml's health check). Kept out of
-		// the stream keyspace so it never collides with a stream path.
-		if r.URL.Path == "/__health" {
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusOK)
-			if r.Method != http.MethodHead {
-				w.Write([]byte("ok\n"))
-			}
-			return
-		}
-		if r.URL.Path == stateSnapshotPrefix || strings.HasPrefix(r.URL.Path, stateSnapshotPrefix+"/") {
-			serveStateSnapshot(srv, w, r)
-			return
-		}
-		srv.ServeHTTP(w, r)
-	})
-
-	httpSrv := &http.Server{Addr: *addr, Handler: handler}
+	// httpapi.NewHandler adapts db to the full Durable Streams wire
+	// protocol plus /__health and /__state; see yasdb/httpapi.
+	httpSrv := &http.Server{Addr: *addr, Handler: httpapi.NewHandler(db)}
 
 	go func() {
 		log.Printf("yasdb %s listening on %s (store=%s, durability=%s)", version, *addr, url, *durability)
@@ -198,7 +187,7 @@ func main() {
 	if metricsSrv != nil {
 		_ = metricsSrv.Shutdown(ctx)
 	}
-	if err := srv.Close(); err != nil {
+	if err := db.Close(); err != nil {
 		log.Printf("close: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package ds
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -67,17 +68,23 @@ func appendOnce(b *testing.B, srv *Server, path string) {
 	}
 }
 
-// benchSerial: one durable append at a time — latency floor = flush interval.
-func benchSerial(b *testing.B, flush time.Duration) {
-	srv := benchServer(b, "", flush)
-	mustCreate(b, srv, "/s", "text/plain")
+// benchSerialSrv: one durable append at a time against an already-built
+// server — latency floor is whatever the backend's durable-write path costs
+// (SlateDB: bound by flush interval; kv: bound by its 2PC commit cost).
+func benchSerialSrv(b *testing.B, srv *Server, path string) {
+	mustCreate(b, srv, path, "text/plain")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		appendOnce(b, srv, "/s")
+		appendOnce(b, srv, path)
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "appends/s")
+}
+
+// benchSerial: one durable append at a time — latency floor = flush interval.
+func benchSerial(b *testing.B, flush time.Duration) {
+	benchSerialSrv(b, benchServer(b, "", flush), "/s")
 }
 
 // benchBurst: `conc` concurrent producers hammer ONE stream. The streamer folds
@@ -125,6 +132,81 @@ func BenchmarkAppendBurstFileStore10ms(b *testing.B) {
 	mustCreate(b, srv, "/s", "text/plain")
 	benchBurst(b, srv, "/s", 128)
 }
+
+// benchNotifierServer forces notifier durability regardless of
+// YASDB_TEST_DURABILITY, since sharedCommitter (the thing under test below)
+// only activates in that mode (see newCommitter).
+func benchNotifierServer(b *testing.B, flush time.Duration) *Server {
+	b.Helper()
+	store, err := OpenStore(uniqueDBPath("bench"), "memory:///", StoreTuning{FlushInterval: flush})
+	if err != nil {
+		b.Fatal(err)
+	}
+	srv, err := NewServer(store, Config{Durability: "notifier", NotifierPollInterval: time.Millisecond})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = srv.Close() })
+	return srv
+}
+
+// benchManyStreams exercises CROSS-stream group commit: numStreams
+// concurrently-hot streams, each with producersPerStream producers, under
+// notifier durability. Every other burst benchmark in this file uses ONE
+// stream — none of them exercise sharedCommitter's actual reason for
+// existing: coalescing bursts ACROSS many different hot streams into
+// fewer physical CommitAsync calls. This benchmark was written to A/B a
+// worker-pool-per-stream-hash-bucket design against the current single
+// shared queue; the worker pool showed a real edge here (in-memory store,
+// 2 vCPUs) but none against real hardware (see RFC 0001) — kept as a
+// permanent regression guard for this dimension, not just a one-off A/B
+// tool.
+//
+// producersPerStream=1 is the purest signal: with only one producer per
+// stream, a stream's own drainBurst can never coalesce anything (there is
+// never more than one queued append per stream at a time), so ANY
+// throughput above the serial baseline must come from sharedCommitter's
+// cross-stream fold, not per-stream batching.
+func benchManyStreams(b *testing.B, numStreams, producersPerStream int) {
+	srv := benchNotifierServer(b, 10*time.Millisecond)
+	paths := make([]string, numStreams)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("/s%d", i)
+		mustCreate(b, srv, paths[i], "text/plain")
+		// mustCreate (PUT) only persists metadata; it does not spawn a
+		// resident streamer (see createStream/handlePut — that's lazy, via
+		// getOrSpawn on first touch). Without this warm-up append, all
+		// numStreams streamers would cold-spawn simultaneously at
+		// b.ResetTimer(), clustering a one-time registry-spawn-lock storm
+		// into the very start of the timed region and dominating a mutex
+		// profile with a startup cost, not steady-state contention.
+		appendOnce(b, srv, paths[i])
+	}
+	var idx atomic.Int64
+	target := int64(b.N)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	for s := 0; s < numStreams; s++ {
+		path := paths[s]
+		for p := 0; p < producersPerStream; p++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx.Add(1) <= target {
+					appendOnce(b, srv, path)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "appends/s")
+}
+
+func BenchmarkAppendBurstManyStreams1024x1(b *testing.B) { benchManyStreams(b, 1024, 1) }
+func BenchmarkAppendBurstManyStreams256x4(b *testing.B)  { benchManyStreams(b, 256, 4) }
+func BenchmarkAppendBurstManyStreams64x1(b *testing.B)   { benchManyStreams(b, 64, 1) }
 
 func BenchmarkReadCatchup(b *testing.B) {
 	srv := benchServer(b, "", 5*time.Millisecond)
