@@ -14,10 +14,18 @@
 # Local data directory created by the server
 yasdb-data
 
-# Maelstrom test store (results/logs) and stray built binaries
+# Maelstrom test store (results/logs) and stray built binaries. Both
+# rules also match same-named source directories (cmd/maelstrom-adapter/,
+# yasdb/) since they have no leading slash; negated below — same fix as
+# .gitignore's for yasdb/.
 store
 maelstrom-adapter
+!cmd/maelstrom-adapter/
 yasdb
+!yasdb/
+
+.git
+benchmark/
 
 # Test binary, built with `go test -c`
 **/*.test
