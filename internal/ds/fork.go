@@ -144,9 +144,24 @@ func (s *Server) createFork(p forkParams) createResult {
 		return createResult{status: http.StatusNotFound}
 	}
 	sourceID := src.StreamID
-	sourceTail, err := s.loadTailSeq(sourceID)
+	// Use the source's live (reader-gated) tail, not a raw durable read:
+	// loadTailSeq reads tailKey directly, which a burst's durable commit
+	// makes visible before that same burst's applyReader runs (both happen
+	// on the streamer's own goroutine, store commit strictly before
+	// applyReader — see commit.go/streamer.go). A raw read can therefore see
+	// a few more records than the source's own resident streamer has
+	// published to st.tail yet, handing back a divergence offset a
+	// concurrent GET on the source can't yet prove exists. liveState
+	// prefers the resident streamer's gated st.tail (falling back to a
+	// durable read only when the source isn't resident, where there is no
+	// gated view to prefer), so it can never promise more than a concurrent
+	// read already can.
+	sourceTail, _, _, srcLive, err := s.liveState(p.sourcePath)
 	if err != nil {
 		return createResult{status: 500}
+	}
+	if !srcLive {
+		return createResult{status: http.StatusNotFound}
 	}
 	sourceJSON := isJSONStream(src.ContentType)
 
@@ -234,11 +249,13 @@ func (s *Server) createFork(p forkParams) createResult {
 		if !matches {
 			return createResult{status: http.StatusConflict}
 		}
-		tailSeq, terr := s.loadTailSeq(existing.StreamID)
+		// Same reasoning as the source-tail read above: prefer the fork's own
+		// live gated state over a raw durable read.
+		tailSeq, closed, _, _, terr := s.liveState(p.path)
 		if terr != nil {
 			return createResult{status: 500}
 		}
-		return createResult{status: http.StatusOK, contentType: existing.ContentType, nextOffset: tailOffset(tailSeq), closed: existing.Closed}
+		return createResult{status: http.StatusOK, contentType: existing.ContentType, nextOffset: tailOffset(tailSeq), closed: closed}
 	}
 
 	// New fork.

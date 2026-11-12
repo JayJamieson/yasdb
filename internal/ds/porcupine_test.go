@@ -24,9 +24,11 @@ package ds
 // interactive HTML visualization and fails with its path.
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -275,6 +277,99 @@ func TestLinearizabilityModelHasTeeth(t *testing.T) {
 	}
 }
 
+// TestLinearizableStreamsRandomized is a property-based sibling of
+// TestLinearizableStreams: instead of a fixed modulo cadence, each client
+// picks its next op (append / catch-up read / long-poll read / SSE read)
+// from a seeded RNG, weighted toward appends. Long-poll and SSE reads reuse
+// streamLogModel unchanged (see doLongPollRead/doSSERead) — they're just a
+// different delivery mechanism for the same "read the log" operation the
+// model already checks. The seed is logged so a failure is reproducible via
+// YASDB_LIN_SEED.
+func TestLinearizableStreamsRandomized(t *testing.T) {
+	if testing.Short() {
+		t.Skip("linearizability check skipped in -short")
+	}
+
+	streams := envInt("YASDB_LIN_RAND_STREAMS", 3)
+	clients := envInt("YASDB_LIN_RAND_CLIENTS", 4) // per stream
+	opsPer := envInt("YASDB_LIN_RAND_OPS", 60)     // ops per client
+
+	seed := time.Now().UnixNano()
+	if v := os.Getenv("YASDB_LIN_SEED"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			seed = n
+		}
+	}
+	t.Logf("seed=%d", seed)
+
+	ts, _ := newRealLiveServer(t, Config{
+		LongPollTimeout: 200 * time.Millisecond,
+		MaxReadBytes:    1 << 20,
+	}, 5*time.Millisecond)
+
+	for s := 0; s < streams; s++ {
+		resp := do(t, ts, "PUT", randStreamPath(s), "", hdr("Content-Type", "application/json"))
+		wantStatus(t, resp, 201)
+		resp.Body.Close()
+	}
+
+	var (
+		clock atomic.Int64
+		hist  = &history{}
+		errs  = &errList{}
+		cl    = &http.Client{Timeout: 15 * time.Second}
+		wg    sync.WaitGroup
+	)
+	now := func() int64 { return clock.Add(1) }
+
+	for s := 0; s < streams; s++ {
+		for c := 0; c < clients; c++ {
+			wg.Add(1)
+			clientID := s*clients + c
+			go func(stream, clientID int, gseed int64) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(gseed))
+				path := ts.URL + randStreamPath(stream)
+				for k := 0; k < opsPer; k++ {
+					switch r := rng.Intn(10); {
+					case r < 6: // 60%: append
+						value := fmt.Sprintf("r-s%d-c%d-%d", stream, clientID, k)
+						doAppend(cl, hist, errs, now, stream, clientID, path, value)
+					case r < 8: // 20%: catch-up read
+						doRead(cl, hist, errs, now, stream, clientID, path)
+					case r < 9: // 10%: long-poll read
+						doLongPollRead(cl, hist, errs, now, stream, clientID, path)
+					default: // 10%: SSE read
+						doSSERead(cl, hist, errs, now, stream, clientID, path)
+					}
+				}
+			}(s, clientID, seed+int64(clientID))
+		}
+	}
+	wg.Wait()
+
+	if msgs := errs.all(); len(msgs) > 0 {
+		t.Fatalf("client errors during load (seed=%d):\n  %s", seed, strings.Join(msgs, "\n  "))
+	}
+
+	model := streamLogModel()
+	res, info := porcupine.CheckOperationsVerbose(model, hist.ops, 30*time.Second)
+
+	switch res {
+	case porcupine.Ok:
+		t.Logf("linearizable: %d ops across %d streams, %d clients (durability=%q, seed=%d)",
+			len(hist.ops), streams, streams*clients, effectiveDurability(), seed)
+	case porcupine.Unknown:
+		t.Logf("porcupine returned Unknown (checker timed out, seed=%d); no violation found in %d ops", seed, len(hist.ops))
+	case porcupine.Illegal:
+		path := filepath.Join(vizDir(t), "linearizability-violation-randomized.html")
+		if err := porcupine.VisualizePath(model, info, path); err != nil {
+			t.Logf("failed to write visualization: %v", err)
+		}
+		t.Fatalf("NOT linearizable (seed=%d) across %d ops — visualization: %s", seed, len(hist.ops), path)
+	}
+}
+
 // --- op drivers (record call/return around each HTTP request) ---------------
 
 func doAppend(cl *http.Client, hist *history, errs *errList, now func() int64, stream, clientID int, path, value string) {
@@ -350,9 +445,120 @@ func doRead(cl *http.Client, hist *history, errs *errList, now func() int64, str
 	})
 }
 
+// doLongPollRead is a read op driver like doRead, but delivered via
+// ?live=long-poll instead of a plain catch-up GET. Reading from offset=-1
+// (start of stream) means data already present is delivered immediately
+// (same as a catch-up read would), so this exercises the long-poll response
+// path (writeLiveData/write204Timeout/write204Closed, ETag, cursor) while
+// still producing a full-log "read" op the unmodified streamLogModel can
+// check like any other read.
+func doLongPollRead(cl *http.Client, hist *history, errs *errList, now func() int64, stream, clientID int, path string) {
+	req, _ := http.NewRequest("GET", path+"?offset=-1&live=long-poll", nil)
+
+	call := now()
+	resp, err := cl.Do(req)
+	if err != nil {
+		errs.add("long-poll: %v", err)
+		return
+	}
+	upToDate := resp.Header.Get("Stream-Up-To-Date")
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	ret := now()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		errs.add("long-poll: status %d", resp.StatusCode)
+		return
+	}
+	if upToDate != "true" {
+		errs.add("long-poll: not up-to-date (history too large for one read?)")
+		return
+	}
+	var values []string
+	if resp.StatusCode == http.StatusOK {
+		var derr error
+		values, derr = decodeJSONArray(b)
+		if derr != nil {
+			errs.add("long-poll: decode %q: %v", string(b), derr)
+			return
+		}
+	}
+	hist.add(porcupine.Operation{
+		ClientId: clientID,
+		Input:    opInput{kind: "read", stream: stream},
+		Output:   opOutput{values: values},
+		Call:     call,
+		Return:   ret,
+	})
+}
+
+// doSSERead is a read op driver delivered via ?live=sse instead of a plain
+// catch-up GET. It accumulates every `data:` event's JSON array until the
+// `control` event reporting upToDate:true, giving the same full-log "read"
+// op shape doRead produces — so, like doLongPollRead, it needs no model
+// changes to be checked by streamLogModel.
+func doSSERead(cl *http.Client, hist *history, errs *errList, now func() int64, stream, clientID int, path string) {
+	req, _ := http.NewRequest("GET", path+"?offset=-1&live=sse", nil)
+
+	call := now()
+	resp, err := cl.Do(req)
+	if err != nil {
+		errs.add("sse: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errs.add("sse: status %d", resp.StatusCode)
+		return
+	}
+
+	var values []string
+	upToDate := false
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	deadline := time.Now().Add(5 * time.Second)
+	for !upToDate && time.Now().Before(deadline) && sc.Scan() {
+		line := sc.Text()
+		payload, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(payload, "[") { // a data event: JSON array of records
+			var chunk []string
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				errs.add("sse: decode data %q: %v", payload, err)
+				return
+			}
+			values = append(values, chunk...)
+			continue
+		}
+		if strings.Contains(payload, `"upToDate":true`) { // the control event
+			upToDate = true
+		}
+	}
+	ret := now()
+	if err := sc.Err(); err != nil {
+		errs.add("sse: scan: %v", err)
+		return
+	}
+	if !upToDate {
+		errs.add("sse: stream ended without an up-to-date control frame")
+		return
+	}
+	hist.add(porcupine.Operation{
+		ClientId: clientID,
+		Input:    opInput{kind: "read", stream: stream},
+		Output:   opOutput{values: values},
+		Call:     call,
+		Return:   ret,
+	})
+}
+
 // --- small helpers ----------------------------------------------------------
 
 func streamPath(s int) string { return fmt.Sprintf("/lin/s%d", s) }
+
+func randStreamPath(s int) string { return fmt.Sprintf("/linrand/s%d", s) }
 
 // offsetSeq parses the seq component of a "<seq>_<byte>" offset.
 func offsetSeq(off string) (int, bool) {

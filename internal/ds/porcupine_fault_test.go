@@ -290,7 +290,7 @@ func prodAppendRetrying(cl *http.Client, hist *history, errs *errList, now func(
 			errs.add("append %s: server error %d", token, status)
 			return
 		}
-		out := prodOutput{status: status}
+		out := prodOutput{status: status, syncMode: effectiveDurability() == "sync"}
 		if status == 200 || status == 204 {
 			n, ok := offsetSeq(next)
 			if !ok {

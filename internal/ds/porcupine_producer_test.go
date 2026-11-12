@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -79,6 +80,11 @@ type prodOutput struct {
 	// fault proxy severed the connection). It may or may not have become durable;
 	// see the nondeterministic branch in Step and porcupine_fault_test.go.
 	indefinite bool
+	// syncMode records whether the request ran under Config.Durability=="sync".
+	// Only used by the predDup branch of Step: a duplicate's echoed tail is a
+	// sound linearization-point observation in sync mode (writer-tail and
+	// durable-tail commit together), but not in notifier mode (see Step).
+	syncMode bool
 }
 
 // recordHash / chainHash: identical folds are used by the model (per accepted
@@ -203,13 +209,18 @@ func producerModel() porcupine.NondeterministicModel {
 				return []interface{}{s.applyAccept(in)}
 			case predDup:
 				// A duplicate performs no write. Its Stream-Next-Offset is an
-				// informational "current tail" hint, not a durability-gated
+				// informational "current tail" hint, not always a durability-gated
 				// observation: in notifier mode it reflects the writer-view tail
 				// (streamer.pend.tail), which runs ahead of the durable tail a
-				// concurrent read sees, so it is not a sound linearization point.
-				// Don't constrain it — exactly-once is still enforced by the
-				// 204-vs-200 status distinction and the accept-tail check.
+				// concurrent read sees, so it is not a sound linearization point
+				// there. In sync mode writer-tail and durable-tail commit together
+				// in one atomic batch (commit.go's syncCommitter), so the echoed
+				// tail *is* sound there and worth checking. Exactly-once itself is
+				// enforced by the 204-vs-200 status distinction regardless of mode.
 				if out.status != 204 {
+					return nil
+				}
+				if out.syncMode && out.tail != s.tail {
 					return nil
 				}
 				return []interface{}{s}
@@ -386,13 +397,14 @@ func TestProducerModelHasTeeth(t *testing.T) {
 	}
 
 	// Legal: two accepts, a duplicate (204, tail unchanged), then a read that sees
-	// both records in order.
+	// both records in order. The duplicate marks syncMode so its echoed tail is
+	// also checked (and matches, since it's a correct 204).
 	r0, r1 := recordHash([]byte("t0")), recordHash([]byte("t1"))
 	readHash := chainHash(chainHash(0, r0), r1)
 	legal := []porcupine.Operation{
 		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 0, rhash: r0}, Output: prodOutput{status: 200, tail: 1}, Call: 1, Return: 2},
 		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 1, rhash: r1}, Output: prodOutput{status: 200, tail: 2}, Call: 3, Return: 4},
-		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 1, rhash: r1}, Output: prodOutput{status: 204, tail: 2}, Call: 5, Return: 6},
+		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 1, rhash: r1}, Output: prodOutput{status: 204, tail: 2, syncMode: true}, Call: 5, Return: 6},
 		{ClientId: 1, Input: prodInput{kind: "read", stream: 0}, Output: prodOutput{status: 200, tail: 2, hash: readHash, hashKnown: true}, Call: 7, Return: 8},
 	}
 	res, info := porcupine.CheckOperationsVerbose(model, legal, 5*time.Second)
@@ -401,6 +413,185 @@ func TestProducerModelHasTeeth(t *testing.T) {
 	}
 	if err := porcupine.VisualizePath(model, info, filepath.Join(t.TempDir(), "producer-ok.html")); err != nil {
 		t.Fatalf("visualize: %v", err)
+	}
+}
+
+// TestProducerModelHasTeethSyncDupTail is a negative control for A1: it proves
+// that in sync mode (writer-tail and durable-tail commit atomically together),
+// a duplicate response echoing the wrong tail is rejected, while the same
+// wrong-tail duplicate is still accepted in notifier mode (syncMode: false),
+// where the field is not a sound linearization-point observation.
+func TestProducerModelHasTeethSyncDupTail(t *testing.T) {
+	nm := producerModel()
+	model := nm.ToModel()
+
+	// BUG (sync mode only): after one accept (tail=1), a duplicate of that same
+	// append echoes tail=5 instead of tail=1. No legal order produces that.
+	wrongDupTailSync := []porcupine.Operation{
+		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 0}, Output: prodOutput{status: 200, tail: 1, syncMode: true}, Call: 1, Return: 2},
+		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 0}, Output: prodOutput{status: 204, tail: 5, syncMode: true}, Call: 3, Return: 4},
+	}
+	if porcupine.CheckOperations(model, wrongDupTailSync) {
+		t.Fatal("wrong duplicate tail accepted in sync mode; model is too weak")
+	}
+
+	// The identical history is legal in notifier mode: the duplicate's tail is
+	// not a sound observation there, so it must not be constrained.
+	wrongDupTailNotifier := []porcupine.Operation{
+		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 0}, Output: prodOutput{status: 200, tail: 1}, Call: 1, Return: 2},
+		{ClientId: 0, Input: prodInput{kind: "append", stream: 0, prod: 0, epoch: 1, seq: 0}, Output: prodOutput{status: 204, tail: 5}, Call: 3, Return: 4},
+	}
+	if !porcupine.CheckOperations(model, wrongDupTailNotifier) {
+		t.Fatal("notifier-mode duplicate with a mismatched (unconstrained) tail was rejected; model regressed to over-constraining")
+	}
+}
+
+// localProducerGen generates a randomized sequence of (epoch, seq) picks for
+// one (stream, producer) goroutine, biased toward actually exercising all
+// five outcomes (accept/dup/stale/bad-seq/gap) rather than a uniform random
+// uint64 pick, which would almost always just land on predGap. It tracks its
+// own view of the last *accepted* (epoch, seq) — mirroring
+// prodState.predict/applyAccept for a single producer — so its picks stay
+// grounded relative to the producer's real trajectory. This is sound because,
+// as in producerScript, each (stream, producer) pair is driven by exactly one
+// goroutine: a producer's fate depends only on its own prior appends.
+type localProducerGen struct {
+	epoch, lastSeq uint64
+	seen           bool
+}
+
+// next picks the next (epoch, seq) to send, weighted toward an accept.
+func (g *localProducerGen) next(rng *rand.Rand) (epoch, seq uint64) {
+	if !g.seen {
+		return 1, 0 // fresh producer must start at seq 0
+	}
+	switch rng.Intn(6) {
+	case 0, 1, 2: // accept (most common)
+		return g.epoch, g.lastSeq + 1
+	case 3: // duplicate (replay the last accepted seq)
+		return g.epoch, g.lastSeq
+	case 4: // gap
+		return g.epoch, g.lastSeq + 2 + uint64(rng.Intn(5))
+	default: // epoch bump: accept-reset, bad-seq, or (if epoch>0) a stale zombie
+		switch rng.Intn(3) {
+		case 0:
+			return g.epoch + 1, 0 // accept (new epoch resets seq)
+		case 1:
+			return g.epoch + 1, g.lastSeq + 3 // bad seq start
+		default:
+			if g.epoch == 0 {
+				return g.epoch + 1, 0
+			}
+			return g.epoch - 1, g.lastSeq + 1 // stale epoch
+		}
+	}
+}
+
+// advance updates the generator's local bookkeeping if (epoch, seq) would be
+// accepted, mirroring prodState.predict for a single producer. It never
+// talks to the server — Porcupine, not this method, is what verifies the
+// server's actual response was correct.
+func (g *localProducerGen) advance(epoch, seq uint64) {
+	accept := false
+	switch {
+	case !g.seen:
+		accept = seq == 0
+	case epoch < g.epoch:
+		accept = false
+	case epoch > g.epoch:
+		accept = seq == 0
+	default:
+		accept = seq == g.lastSeq+1
+	}
+	if accept {
+		g.epoch, g.lastSeq, g.seen = epoch, seq, true
+	}
+}
+
+// TestLinearizableProducersRandomized is a property-based sibling of
+// TestLinearizableProducers: each (stream, producer) goroutine drives a
+// randomized (epoch, seq) sequence via localProducerGen instead of the fixed
+// 13-step producerScript. Reuses producerModel() unchanged. The seed is
+// logged so a failure is reproducible via YASDB_LIN_SEED.
+func TestLinearizableProducersRandomized(t *testing.T) {
+	if testing.Short() {
+		t.Skip("producer linearizability check skipped in -short")
+	}
+
+	streams := envInt("YASDB_PROD_RAND_STREAMS", 3)
+	opsPer := envInt("YASDB_PROD_RAND_OPS", 40)
+
+	seed := time.Now().UnixNano()
+	if v := os.Getenv("YASDB_LIN_SEED"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			seed = n
+		}
+	}
+	t.Logf("seed=%d", seed)
+
+	ts, _ := newRealLiveServer(t, Config{
+		LongPollTimeout: 200 * time.Millisecond,
+		MaxReadBytes:    1 << 20,
+	}, 5*time.Millisecond)
+
+	for s := 0; s < streams; s++ {
+		resp := do(t, ts, "PUT", prodRandStreamPath(s), "", hdr("Content-Type", "application/json"))
+		wantStatus(t, resp, 201)
+		resp.Body.Close()
+	}
+
+	var (
+		clock atomic.Int64
+		hist  = &history{}
+		errs  = &errList{}
+		cl    = &http.Client{Timeout: 15 * time.Second}
+		wg    sync.WaitGroup
+	)
+	now := func() int64 { return clock.Add(1) }
+
+	for s := 0; s < streams; s++ {
+		for p := 0; p < numProducers; p++ {
+			wg.Add(1)
+			clientID := s*numProducers + p
+			go func(stream, prod, clientID int, gseed int64) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(gseed))
+				var gen localProducerGen
+				path := ts.URL + prodRandStreamPath(stream)
+				pid := fmt.Sprintf("p%d", prod)
+				for i := 0; i < opsPer; i++ {
+					epoch, seq := gen.next(rng)
+					prodAppend(cl, hist, errs, now, stream, prod, clientID, path, pid, epoch, seq)
+					gen.advance(epoch, seq)
+					if i%5 == 4 {
+						prodRead(cl, hist, errs, now, stream, clientID, path)
+					}
+				}
+				prodRead(cl, hist, errs, now, stream, clientID, path)
+			}(s, p, clientID, seed+int64(clientID))
+		}
+	}
+	wg.Wait()
+
+	if msgs := errs.all(); len(msgs) > 0 {
+		t.Fatalf("client errors during load (seed=%d):\n  %s", seed, strings.Join(msgs, "\n  "))
+	}
+
+	nm := producerModel()
+	model := nm.ToModel()
+	res, info := porcupine.CheckOperationsVerbose(model, hist.ops, 60*time.Second)
+	switch res {
+	case porcupine.Ok:
+		t.Logf("linearizable: %d ops across %d streams, %d producers/stream (durability=%q, seed=%d)",
+			len(hist.ops), streams, numProducers, effectiveDurability(), seed)
+	case porcupine.Unknown:
+		t.Logf("porcupine returned Unknown (checker timed out, seed=%d); no violation found in %d ops", seed, len(hist.ops))
+	case porcupine.Illegal:
+		path := filepath.Join(vizDir(t), "producer-violation-randomized.html")
+		if err := porcupine.VisualizePath(model, info, path); err != nil {
+			t.Logf("visualization: %v", err)
+		}
+		t.Fatalf("producer history NOT linearizable (seed=%d, %d ops) — visualization: %s", seed, len(hist.ops), path)
 	}
 }
 
@@ -429,7 +620,7 @@ func prodAppend(cl *http.Client, hist *history, errs *errList, now func() int64,
 		errs.add("append %s: server error %d", token, resp.StatusCode)
 		return
 	}
-	out := prodOutput{status: resp.StatusCode}
+	out := prodOutput{status: resp.StatusCode, syncMode: effectiveDurability() == "sync"}
 	if resp.StatusCode == 200 || resp.StatusCode == 204 {
 		n, ok := offsetSeq(next)
 		if !ok {
@@ -494,3 +685,5 @@ func prodRead(cl *http.Client, hist *history, errs *errList, now func() int64, s
 }
 
 func prodStreamPath(s int) string { return fmt.Sprintf("/prod/s%d", s) }
+
+func prodRandStreamPath(s int) string { return fmt.Sprintf("/prodrand/s%d", s) }

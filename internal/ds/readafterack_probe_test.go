@@ -110,6 +110,109 @@ func TestProbeReadAfterAck(t *testing.T) {
 	}
 }
 
+// TestProbeReadAfterCloseStrict is a direct, causally-ordered probe (like
+// TestProbeReadAfterAck) for the append-vs-close interaction
+// porcupine_lifecycle_test.go's TestLinearizableStreamLifecycle can't
+// soundly check via real-time intervals in notifier mode (see that file's
+// package comment): after a close's own response is received, a
+// strictly-subsequent read must reflect at least everything that was
+// acknowledged before the close returned. Unlike the Porcupine check, this
+// establishes happens-before by blocking on each response rather than by
+// comparing concurrent operations' Call/Return intervals, so it stays sound
+// regardless of the writer-view/durable-view skew notifier mode has for
+// append-vs-close ordering specifically.
+func TestProbeReadAfterCloseStrict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("read-after-close probe skipped in -short")
+	}
+	const iterations = 100
+	for _, mode := range []string{"sync", "notifier"} {
+		t.Run(mode, func(t *testing.T) {
+			violations := 0
+			for iter := 0; iter < iterations; iter++ {
+				ts, _ := startServer(t, mustMemStore(t), Config{
+					Durability:           mode,
+					NotifierPollInterval: time.Millisecond,
+					LongPollTimeout:      100 * time.Millisecond,
+					MaxReadBytes:         1 << 20,
+				})
+				resp := do(t, ts, "PUT", "/closeprobe", "", hdr("Content-Type", "application/json"))
+				wantStatus(t, resp, 201)
+				resp.Body.Close()
+
+				cl := &http.Client{Timeout: 10 * time.Second}
+				var maxAcked atomic.Int64
+				var wg sync.WaitGroup
+
+				// Fire N concurrent appends. Each goroutine tracks maxAcked only
+				// after ITS OWN response returns (real happens-before for that
+				// append, same discipline as TestProbeReadAfterAck).
+				const n = 8
+				for i := 0; i < n; i++ {
+					wg.Add(1)
+					go func(i int) {
+						defer wg.Done()
+						body := fmt.Sprintf(`["v%d"]`, i)
+						r, _ := http.NewRequest("POST", ts.URL+"/closeprobe", strings.NewReader(body))
+						r.Header.Set("Content-Type", "application/json")
+						resp, err := cl.Do(r)
+						if err != nil {
+							t.Errorf("append: %v", err)
+							return
+						}
+						next := resp.Header.Get("Stream-Next-Offset")
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+						if seq, ok := offsetSeq(next); ok {
+							for {
+								cur := maxAcked.Load()
+								if int64(seq) <= cur || maxAcked.CompareAndSwap(cur, int64(seq)) {
+									break
+								}
+							}
+						}
+					}(i)
+				}
+				wg.Wait()
+
+				// Close, and wait for its own response — establishing real
+				// happens-before for everything acked so far.
+				r, _ := http.NewRequest("POST", ts.URL+"/closeprobe", nil)
+				r.Header.Set("Stream-Closed", "true")
+				resp, err := cl.Do(r)
+				if err != nil {
+					t.Fatalf("close: %v", err)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+
+				expected := maxAcked.Load()
+
+				// Strictly after the close's own response: a read must see at
+				// least `expected` records.
+				rr, _ := http.NewRequest("GET", ts.URL+"/closeprobe?offset=-1", nil)
+				rresp, err := cl.Do(rr)
+				if err != nil {
+					t.Fatalf("read: %v", err)
+				}
+				b, _ := io.ReadAll(rresp.Body)
+				rresp.Body.Close()
+				values, _ := decodeJSONArray(b)
+				got := int64(len(values))
+				if got < expected {
+					violations++
+					if violations <= 5 {
+						t.Logf("iter=%d: %d acked before close returned, read after close saw only %d", iter, expected, got)
+					}
+				}
+			}
+			if violations > 0 {
+				t.Errorf("%s mode: %d/%d read-after-close-ack violations", mode, violations, iterations)
+			}
+		})
+	}
+}
+
 func mustMemStore(t *testing.T) Storage {
 	t.Helper()
 	store, err := OpenStore(uniqueDBPath("probe"), "memory:///", StoreTuning{FlushInterval: 5 * time.Millisecond})

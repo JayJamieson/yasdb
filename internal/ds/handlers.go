@@ -205,11 +205,17 @@ func (s *Server) createStream(p createParams) createResult {
 		if !matches {
 			return createResult{status: http.StatusConflict}
 		}
-		tailSeq, err := s.loadTailSeq(meta.StreamID)
+		// Prefer the stream's live gated state (liveState) over a raw durable
+		// read: a durable commit's data is visible via loadTailSeq/loadMeta
+		// before that commit's applyReader has published it to the stream's
+		// own live readers (both run on the streamer's own goroutine, store
+		// commit strictly before applyReader — see commit.go/streamer.go),
+		// so a raw read can promise more than a concurrent GET can yet prove.
+		tailSeq, closed, _, _, err := s.liveState(p.path)
 		if err != nil {
 			return createResult{status: 500}
 		}
-		return createResult{status: http.StatusOK, contentType: meta.ContentType, nextOffset: tailOffset(tailSeq), closed: meta.Closed}
+		return createResult{status: http.StatusOK, contentType: meta.ContentType, nextOffset: tailOffset(tailSeq), closed: closed}
 	}
 
 	// New stream. Derive initial records from the body.

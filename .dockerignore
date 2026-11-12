@@ -2,6 +2,13 @@
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
+
+# Never needed by the build: not read by the Dockerfile, and nothing under
+# the root module imports either. .git/ alone was ~74 MB of the 112 MB
+# build context (flyctl's own WARN); benchmark/ (~9 MB, its loadshape/
+# subdir is even its own separate Go module) is dev/ops tooling.
+.git
+benchmark
 # Binaries for programs and plugins
 **/*.exe
 **/*.exe~
@@ -23,9 +30,6 @@ maelstrom-adapter
 !cmd/maelstrom-adapter/
 yasdb
 !yasdb/
-
-.git
-benchmark/
 
 # Test binary, built with `go test -c`
 **/*.test
