@@ -2,7 +2,7 @@
 
 ## Native library / SlateDB binding
 
-yasdb links the SlateDB UniFFI binding (`slatedb.io/slatedb-go v0.14.1`)
+yasdb links the SlateDB UniFFI binding (`slatedb.io/slatedb-go v0.18.1`)
 over cgo. It ships the matching native library at
 `lib/libslatedb_uniffi.so`, built for linux/amd64 from the SlateDB commit
 the binding was generated against. The `Makefile` sets the linker/loader
@@ -19,26 +19,31 @@ durability modes. `-durability` selects the mode, injected as a
 
 - **`sync`** (default). The streamer group-commits: it drains a burst of
   queued appends, validates them against one pending view, and lands all
-  accepted effects in a single atomic durable batch (`AwaitDurable:
-  true`). This coalesces N appends into one durability round-trip. A
-  single stream's throughput is bounded by `maxBurst / flush`.
+  accepted effects in a single atomic batch, then waits on that write
+  with `WriteHandle.AwaitDurable`. This coalesces N appends into one
+  durability round-trip. A single stream's throughput is bounded by
+  `maxBurst / flush`.
 - **`notifier`**. This is the durability-notifier technique (as in
-  s2-lite): yasdb writes non-durably (`AwaitDurable: false`), which
-  returns immediately with an engine seqnum, and acknowledges from a
-  single background watcher of the durable watermark
-  (`Db.Status().DurableSeq`, polled). The streamer keeps a writer-tail
-  that runs ahead of the reader-visible durable-tail, so appends pipeline
-  instead of blocking on the flush. A stream does not retire while
-  durability callbacks are outstanding, so a respawn can never read a
-  stale tail. This scales single-stream concurrent throughput with
-  concurrency, instead of plateauing at `maxBurst / flush` (see
-  `BENCHMARKS.md`). Reader-tail publication is strictly ordered: every
-  durability callback fires on the single watcher goroutine, never inline
-  on the writer. So an acknowledged offset is always immediately
-  readable (read-after-acknowledge holds). An earlier ordering bug let an
-  already-durable acknowledgement fire on the writer goroutine and race
-  the watcher, which could momentarily regress the reader-visible tail.
-  That bug is fixed, and `TestProbeReadAfterAck` guards against it.
+  s2-lite): yasdb writes without awaiting durability, which returns
+  immediately with an engine seqnum (`WriteHandle.Seqnum`), and
+  acknowledges from a single background watcher of the durable watermark.
+  On the SlateDB backend that watcher blocks inside the engine's status
+  subscription (`Db.Subscribe().WaitForChange`, slatedb-go v0.18+). A
+  backend that cannot push, such as `pwal://` or an embedder's own
+  `Storage`, polls `DurableSeq()` every `-notifier-poll` instead. The
+  streamer keeps a writer-tail that runs ahead of the reader-visible
+  durable-tail, so appends pipeline instead of blocking on the flush. A
+  stream does not retire while durability callbacks are outstanding, so a
+  respawn can never read a stale tail. This scales single-stream
+  concurrent throughput with concurrency, instead of plateauing at
+  `maxBurst / flush` (see `BENCHMARKS.md`). Reader-tail publication is
+  strictly ordered: every durability callback fires on the single watcher
+  goroutine, never inline on the writer. So an acknowledged offset is
+  always immediately readable (read-after-acknowledge holds). An earlier
+  ordering bug let an already-durable acknowledgement fire on the writer
+  goroutine and race the watcher, which could momentarily regress the
+  reader-visible tail. That bug is fixed, and `TestProbeReadAfterAck`
+  guards against it.
 
 Both modes pass the full suite under `-race` and the Maelstrom kafka
 log-consistency and crash-injection checks.

@@ -204,15 +204,18 @@ func (sc *sharedCommitter) runFlush(jobs []commitJob) {
 		} else {
 			for _, j := range jobs {
 				j := j
-				sc.notifier.subscribe(seq, func(cerr error) {
-					if cerr == nil {
-						j.st.applyReader(j.targetTail, j.targetClosed, j.c.seg)
-					} else {
-						failAccepted(j.c.batch, j.c.responses, j.c.accepted, cerr)
+				err := sc.notifier.subscribe(seq, func(cerr error) {
+					if cerr != nil {
+						failJob(j, cerr)
+						return
 					}
+					j.st.applyReader(j.targetTail, j.targetClosed, j.c.seg)
 					replyAll(j.c.batch, j.c.responses)
 					j.st.pending.Add(-1)
 				})
+				if err != nil {
+					failJob(j, err)
+				}
 			}
 		}
 

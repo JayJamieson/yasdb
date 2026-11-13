@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	slatedb "slatedb.io/slatedb-go/uniffi"
@@ -104,6 +105,17 @@ type slateStore struct {
 	db       *slatedb.Db
 	store    *slatedb.ObjectStore
 	recorder *slatedb.DefaultMetricsRecorder
+
+	// sub is SlateDB v0.18's status subscription, the push source behind
+	// WatchDurable. subMu guards its liveness against Close. uniffi
+	// refcounts the native handle, so a WaitForChange already in flight
+	// survives a Destroy, but one that STARTS after a Destroy panics with
+	// "object has already been destroyed". So the property to enforce is
+	// "no call may start after Destroy", which is what subClosed under the
+	// write lock gives. Read-held for the length of a watch call.
+	subMu     sync.RWMutex
+	sub       *slatedb.DbStatusSubscription
+	subClosed bool
 }
 
 // MetricsProvider is implemented by Storage backends that expose native
@@ -112,6 +124,79 @@ type slateStore struct {
 // this to the small Storage interface itself.
 type MetricsProvider interface {
 	MetricsSnapshot() []slatedb.Metric
+}
+
+// DurabilitySubscriber is the optional capability a Storage backend
+// implements when it can block until its durable watermark advances, rather
+// than being polled for it. Only slateStore does, via SlateDB v0.18's status
+// subscription. pwalStore, the test fake, and any embedder-supplied backend
+// are polled through DurableSeq at Config.NotifierPollInterval instead.
+//
+// Like MetricsProvider above, callers type-assert for this rather than
+// growing the small Storage interface, which is public API that embedders
+// implement themselves (yasdb/storage.go).
+//
+// A decorator that embeds the Storage interface does not inherit this and
+// silently falls back to polling. That is correct, just slower; forward
+// WatchDurable explicitly to keep the push path.
+type DurabilitySubscriber interface {
+	// WatchDurable blocks until the backend's durable watermark is known to
+	// exceed after, then returns it. It must return promptly once stop is
+	// closed, or bound itself some other way, because Server.Close joins the
+	// watcher goroutine and cannot interrupt it. See watchDurable in
+	// durability.go for the full contract, including why the returned
+	// watermark must be an observation and never a floor the caller already
+	// knew, and yasdb/storage.go for the copy an embedder can read.
+	WatchDurable(after uint64, stop <-chan struct{}) (durable uint64, err error)
+}
+
+// watchTimeout bounds one wait for the durable watermark to advance, in both
+// the push and the poll implementation. It is not a poll interval: the
+// notifier waits only while an acknowledgement is outstanding, so an idle
+// server never arms it. It is a liveness backstop, so a wedged engine
+// degrades to a re-check instead of hanging.
+const watchTimeout = 250 * time.Millisecond
+
+// WatchDurable implements DurabilitySubscriber over the v0.18 subscription.
+//
+// stop is ignored, because WaitForChange is an uninterruptible FFI call: once
+// it is entered there is nothing to select on. What bounds this instead is
+// the watchTimeout the call is given, so the notifier's join waits at most
+// that long. Server.Close is also ordered to call db.Shutdown() before
+// destroying the subscription, which unparks a watch in flight at once
+// (TestSlateStoreCloseWithWatchParked), so watchTimeout is the backstop
+// rather than the usual cost.
+//
+// The binding reports a close as a VALUE, not an error: (status, nil) with
+// status.CloseReason set. (nil, nil) is the timeout. (nil, err) is the watch
+// sender being dropped. All three are folded here, so the notifier sees only
+// a watermark or a closed store.
+func (s *slateStore) WatchDurable(after uint64, _ <-chan struct{}) (uint64, error) {
+	s.subMu.RLock()
+	defer s.subMu.RUnlock()
+	if s.subClosed {
+		return 0, errStoreClosed
+	}
+	st, err := s.sub.WaitForChange(after, uint32(watchTimeout/time.Millisecond))
+	if err != nil {
+		return 0, errStoreClosed
+	}
+	if st == nil {
+		// Echoing after back would be a watermark the engine never
+		// reported, and the notifier carries this value forward as the
+		// baseline it acknowledges against. Status() is non-blocking and
+		// reads the same snapshot the subscription holds, so the timeout
+		// path returns a real observation instead.
+		cur := s.sub.Status()
+		if cur.CloseReason != nil {
+			return cur.DurableSeq, errStoreClosed
+		}
+		return cur.DurableSeq, nil
+	}
+	if st.CloseReason != nil {
+		return st.DurableSeq, errStoreClosed
+	}
+	return st.DurableSeq, nil
 }
 
 // MetricsSnapshot returns a point-in-time snapshot of every metric SlateDB
@@ -236,7 +321,7 @@ func openStore(path, storeURL string, settings *slatedb.Settings) (*slateStore, 
 		store.Destroy()
 		return nil, err
 	}
-	return &slateStore{db: db, store: store, recorder: recorder}, nil
+	return &slateStore{db: db, store: store, recorder: recorder, sub: db.Subscribe()}, nil
 }
 
 var readOpts = slatedb.ReadOptions{
@@ -278,8 +363,17 @@ func (s *slateStore) Commit(ops []Op, awaitDurable bool) error {
 			return err
 		}
 	}
-	_, err := s.db.WriteWithOptions(batch, slatedb.WriteOptions{AwaitDurable: awaitDurable})
-	return err
+	h, err := s.db.WriteWithOptions(batch, slatedb.WriteOptions{})
+	if h != nil {
+		defer h.Destroy()
+	}
+	if err != nil {
+		return err
+	}
+	if awaitDurable {
+		return h.AwaitDurable()
+	}
+	return nil
 }
 
 func (s *slateStore) CommitAsync(ops []Op) (uint64, error) {
@@ -296,11 +390,14 @@ func (s *slateStore) CommitAsync(ops []Op) (uint64, error) {
 			return 0, err
 		}
 	}
-	h, err := s.db.WriteWithOptions(batch, slatedb.WriteOptions{AwaitDurable: false})
+	h, err := s.db.WriteWithOptions(batch, slatedb.WriteOptions{})
+	if h != nil {
+		defer h.Destroy()
+	}
 	if err != nil {
 		return 0, err
 	}
-	return h.Seqnum, nil
+	return h.Seqnum(), nil
 }
 
 func (s *slateStore) DurableSeq() (uint64, error) {
@@ -328,8 +425,17 @@ func (s *slateStore) Scan(start, end []byte) (Iterator, error) {
 	return &slateIter{it: it}, nil
 }
 
+// Close shuts the engine down before destroying anything. Shutdown is the
+// only call that unparks an in-flight WaitForChange: db.Destroy() leaves a
+// parked waiter parked indefinitely. Destroying the subscription after that
+// is therefore provably not racing a live call, and subClosed stops a later
+// one from starting on a freed handle.
 func (s *slateStore) Close() error {
 	err := s.db.Shutdown()
+	s.subMu.Lock()
+	s.subClosed = true
+	s.sub.Destroy()
+	s.subMu.Unlock()
 	s.db.Destroy()
 	s.store.Destroy()
 	s.recorder.Destroy()

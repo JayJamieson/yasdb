@@ -38,12 +38,13 @@ either group of settings.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-addr` | `:4437` | Listen address (4437 is the Durable Streams default port) |
+| `-auth-token` | *(empty)* | Shared secret that every request to `-addr` must send as `Authorization: Bearer <token>`. Empty means: no authentication, and anyone who can reach `-addr` can read, write, and delete any stream. Prefer `YASDB_AUTH_TOKEN`, which this flag overrides. See [Authentication](#authentication). |
 | `-store` | *(empty)* | Object-store URL (`memory:///`, `s3://bucket`). Empty means: use a local file store under `-data`. |
 | `-data` | `./yasdb-data` | Local data directory, used when `-store` is empty |
 | `-db` | `yasdb` | Database path/prefix within the object store |
 | `-flush` | `10ms` | WAL flush interval. This is the floor on single-append durable latency. `0` means: use the engine default (100ms). |
 | `-durability` | `notifier` | `notifier`: pipelines appends and acknowledges them from a durable-seq watcher (default; scales with concurrent writers). `sync`: blocks each write until it is durable. Use `sync` for lower latency with one low-concurrency writer, and for crash-recovery testing. |
-| `-notifier-poll` | `1ms` | Durable-seq poll interval in `notifier` mode |
+| `-notifier-poll` | `1ms` | Durable-seq poll interval in `notifier` mode, for backends that cannot push durability updates (`-store pwal://`, or an embedder's own `Storage`). The SlateDB backend subscribes instead, and ignores this. |
 | `-longpoll-timeout` | `0` | How long a `live=long-poll` read blocks before it returns `204`. `0` means: use the default (25s). |
 | `-metrics-addr` | *(empty)* | Listen address for a Prometheus `/metrics` endpoint of native SlateDB engine metrics. Empty means: disabled. Use a separate, non-public address (see `fly.toml`'s `[metrics]` block). |
 | `-slatedb-log-level` | `warn` | SlateDB native (Rust-side) log level to stderr: `off\|error\|warn\|info\|debug\|trace`. Use `debug` or `trace` to diagnose stalls (see BENCHMARKS.md); both are verbose. |
@@ -67,6 +68,53 @@ re-testing with the load generator and the server on separate Fly machines
 before you can draw a real conclusion. See [`docs/DEPLOY.md`](./docs/DEPLOY.md)'s
 "Reading metrics from a load test" section to pull the numbers back
 afterwards.
+
+## Authentication
+
+yasdb takes one shared secret. Set `YASDB_AUTH_TOKEN` and every request to
+`-addr` has to send it as a bearer token.
+
+```bash
+YASDB_AUTH_TOKEN=$(openssl rand -hex 32) yasdb -addr :4437
+curl -H "Authorization: Bearer $YASDB_AUTH_TOKEN" http://localhost:4437/orders
+```
+
+Leave it unset and yasdb runs with no authentication at all. It logs a
+warning at startup when you do, because anyone who can reach `-addr` can
+then read, write, and delete any stream.
+
+`-auth-token` sets the same secret and overrides the environment variable.
+Prefer the environment variable on a real deployment. Every local user can
+read another process's arguments from `ps` and `/proc/<pid>/cmdline`, so a
+flag publishes the secret to the whole machine. On Fly:
+
+```bash
+fly secrets set YASDB_AUTH_TOKEN=$(openssl rand -hex 32)
+```
+
+With a token set, three things stay reachable without one.
+
+- `GET /__health`. Fly's health check polls it every 15 seconds and sends
+  no header (see `fly.toml`). A `401` there marks the machine unhealthy and
+  restarts it in a loop.
+- `OPTIONS`. A browser sends the CORS preflight with no `Authorization`
+  header, so a `401` stops the real request before the browser sends it.
+  The preflight answers with `Access-Control-Allow-Headers: *`, which is
+  what lets the real request carry the token.
+- `/metrics` and `/debug/pprof/` on `-metrics-addr`. Fly scrapes `/metrics`
+  over the private network and cannot send a bearer header. Keep that
+  address off the public internet. `POST /__admin/bulk-provision`, on the
+  same listener, does require the token.
+
+Everything else on `-addr` needs the token, `/__admin/streams` and
+`/__state/` included. A wrong token and a missing one both return `401`
+with the same body, so the response never says which it was.
+
+This is one secret for the whole server. There are no users and no scopes.
+To change the token, change the value and restart.
+
+Embedders get the same check as `httpapi.RequireBearerToken(token, next)`,
+which returns `next` unwrapped when `token` is empty.
 
 ## Storage backends
 

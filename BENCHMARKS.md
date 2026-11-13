@@ -397,10 +397,14 @@ They differ in whether the append **blocks** on durability:
   This is simple; a stream's throughput is capped at `maxBurst / flush`,
   because the streamer serialises on the durable write.
 - **`notifier`** — write non-durably (returns at once with an engine
-  seqnum) and acknowledge via a single **durable-seq watcher**
-  (`Db.Status().DurableSeq`). The streamer pipelines the next append
-  while prior ones await durability. This is the "durability
-  notifier" / s2-lite technique.
+  seqnum) and acknowledge from a single **durable-seq watcher**. On the
+  SlateDB backend that watcher blocks inside the engine's status
+  subscription (`Db.Subscribe().WaitForChange`, slatedb-go v0.18+), so
+  an acknowledgement is chained to the WAL flush that made the write
+  durable. A backend that cannot push (`pwal://`, an embedder's own
+  `Storage`) polls `DurableSeq()` every `-notifier-poll` instead. The
+  streamer pipelines the next append while prior ones await durability.
+  This is the "durability notifier" / s2-lite technique.
 
 Single stream, one process — concurrent appends/s across storage
 backends:
@@ -437,6 +441,39 @@ object-storage deployment.
 a client that waits for each acknowledgement pays one flush per append
 in both modes. The win is *concurrent* throughput. In-flight appends are
 bounded by client concurrency, since each blocked request holds one.
+
+### Push vs poll acknowledgement
+
+Before slatedb-go v0.18 the binding had no subscription, so the watcher
+polled `Db.Status()` on a 1 ms ticker. v0.18's status subscription
+replaced that poll. Measured on a 2-vCPU AMD EPYC box against the
+in-memory store, 7 interleaved runs per side, median and range:
+
+| flush | conc | poll | subscription | change |
+| ---- | ---- | ---- | ---- | ---- |
+| 10 ms | 128  | 11,437 (11,369–11,513) | 11,431 (11,325–11,505) | none |
+| 10 ms | 1024 | 81,469 (70,970–84,378) | 80,779 (69,144–84,873) | none |
+| 5 ms  | 1024 | 94,265 (92,943–94,898) | 107,699 (102,315–113,860) | **+14%** |
+
+At a 10 ms flush the acknowledgement path is not the limiter.
+Throughput tracks `concurrency / flush interval`: 1024 concurrent
+appends give 19,816/s at 50 ms, 47,908/s at 20 ms, and 87,400/s at
+10 ms, within 15% of `1024 / flush` each time. Removing a
+sub-millisecond detection delay cannot move a number the flush interval
+sets, and it does not. Every benchmark in `make bench` is unchanged at
+that flush, the serial and file-store ones included.
+
+At a 5 ms flush it does. All seven subscription runs beat all seven
+poll runs. The gain is not the poll's nominal period: tuning the
+baseline's `-notifier-poll` down from 1 ms to 100 µs to 20 µs gives
+94,239, 92,588, and 96,130 appends/s, still short of the subscription.
+Neither side is CPU-bound (56% and 63% of two cores), so what remains
+is acknowledgement latency that the poll interval does not control.
+
+The mechanism shrinks either way. 40,000 appends at conc 128 cost 4,332
+FFI durability calls under the poll and 315 under the subscription, the
+latter being one wake per WAL flush. Allocation per append drops from
+3,298 B / 28 allocs to 2,903 B / 25 allocs.
 
 **Correctness.** The full suite passes in both modes under `-race`
 (`YASDB_TEST_DURABILITY=notifier make test`). The Jepsen Maelstrom kafka
