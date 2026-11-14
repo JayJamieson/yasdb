@@ -1,21 +1,22 @@
 // Command maelstrom-adapter bridges a Jepsen Maelstrom "kafka" workload to a
 // running yasdb server, so Maelstrom's log-consistency checker can validate
-// yasdb's append/read path under concurrency.
+// yasdb's append and read path under concurrency.
 //
-// Maelstrom speaks newline-delimited JSON on stdin/stdout; this adapter
-// translates each RPC to yasdb HTTP against $YASDB_URL:
+// Maelstrom speaks newline-delimited JSON on stdin and stdout. The adapter
+// translates each RPC into a yasdb HTTP call against $YASDB_URL.
 //
 //	send {key,msg}                 -> POST /mlst/<key>   (JSON append)  -> offset
 //	poll {offsets}                 -> GET  /mlst/<key>?offset=<seq>     -> [[offset,msg]]
 //	commit_offsets / list_...      -> in-process committed-offset store
 //
-// A Kafka offset is the message's yasdb sequence number: appending one JSON
-// message advances the tail by one, so the message's offset = nextSeq-1, and a
-// poll from offset N reads the JSON array of messages at seqs N, N+1, ….
+// A Kafka offset is the message's yasdb sequence number. Appending one JSON
+// message advances the tail by one, so the message's offset is nextSeq-1, and a
+// poll from offset N reads the JSON array of messages at seqs N, N+1, and so on.
 //
 // Run with a single Maelstrom node (--node-count 1) so committed offsets share
-// one process; concurrency comes from --concurrency/--rate, all hitting the one
-// shared yasdb server. This is a pure-Go binary (no cgo / SlateDB needed).
+// one process. Concurrency comes from --concurrency and --rate, all hitting the
+// one shared yasdb server. This binary is pure Go and needs neither cgo nor
+// SlateDB.
 package main
 
 import (
@@ -41,17 +42,18 @@ var (
 	base   = envOr("YASDB_URL", "http://127.0.0.1:4437")
 	client = &http.Client{Timeout: 30 * time.Second}
 
-	// readMode selects how polls read: "catchup" (default, GET ?offset=) or
-	// "long-poll" (GET ?offset=&live=long-poll), which drives yasdb's live-read +
-	// record-cache path so Maelstrom validates it under randomized load. Run the
-	// server with a short -longpoll-timeout so caught-up polls return 204 quickly.
+	// readMode selects how a poll reads. The default "catchup" issues
+	// GET ?offset=. "long-poll" issues GET ?offset=&live=long-poll, which drives
+	// yasdb's live-read and record-cache path so Maelstrom checks that path under
+	// randomized load too. Run the server with a short -longpoll-timeout so a
+	// caught-up poll returns 204 without a long wait.
 	readMode = envOr("YASDB_MLST_READ", "catchup")
 
 	outMu  sync.Mutex // serialises stdout writes
 	nextID atomic.Int64
 
 	commitMu sync.Mutex
-	commits  = map[string]int64{} // committed offset per key (single-node)
+	commits  = map[string]int64{}
 )
 
 func envOr(k, d string) string {
@@ -68,13 +70,14 @@ var (
 	yasdbArgs []string
 )
 
-// superviseYasdb starts the yasdb binary as a child bound to a persistent store
-// on a fixed port, waits for health, and points `base` at it. The child dies
-// with us via PDEATHSIG. When YASDB_CHAOS_MS is set, a background loop SIGKILLs
-// and restarts yasdb on that cadence — real crashes on the same persistent store
-// — so Maelstrom's log-consistency checker verifies that acked writes survive
-// crashes and recovery. yasdb logs go to our stderr (stdout is the Maelstrom
-// protocol channel).
+// superviseYasdb starts the yasdb binary as a child on a fixed port with a
+// persistent store, waits for it to report healthy, and points base at it. The
+// child dies with the adapter via PDEATHSIG. When YASDB_CHAOS_MS is set, a
+// background loop kills yasdb on that cadence and restarts it, so Maelstrom's
+// log-consistency checker sees whether acked writes survive a real crash and a
+// real recovery from the store. YASDB_CHAOS_WINDOW_MS limits how long that loop
+// runs. See chaosLoop. yasdb's own logs go to stderr, because stdout carries
+// the Maelstrom protocol.
 func superviseYasdb(bin string) {
 	runtime.LockOSThread() // keep PDEATHSIG bound to a live thread
 	yasdbBin = bin
@@ -95,7 +98,14 @@ func superviseYasdb(bin string) {
 	fmt.Fprintln(os.Stderr, "supervise: yasdb ready")
 
 	if ms, _ := strconv.Atoi(os.Getenv("YASDB_CHAOS_MS")); ms > 0 {
-		go chaosLoop(time.Duration(ms) * time.Millisecond)
+		var until time.Time
+		if w, _ := strconv.Atoi(os.Getenv("YASDB_CHAOS_WINDOW_MS")); w > 0 {
+			until = time.Now().Add(time.Duration(w) * time.Millisecond)
+			fmt.Fprintf(os.Stderr, "chaos: crashing yasdb every ~%dms for %dms\n", ms, w)
+		} else {
+			fmt.Fprintf(os.Stderr, "chaos: crashing yasdb every ~%dms for the whole run\n", ms)
+		}
+		go chaosLoop(time.Duration(ms)*time.Millisecond, until)
 	}
 }
 
@@ -114,21 +124,35 @@ func startYasdb() {
 	childMu.Unlock()
 }
 
-// chaosLoop repeatedly crashes (SIGKILL) yasdb and restarts it, forcing recovery
-// from the persistent store while the workload runs.
-func chaosLoop(interval time.Duration) {
+// chaosLoop kills yasdb with SIGKILL and restarts it on a cadence, so every
+// restart recovers from the persistent store while the workload runs.
+//
+// The loop stops once the clock passes until, and yasdb then stays up for the
+// rest of the run. Without that quiesce window a crash can land in Maelstrom's
+// final read phase, where no poll reaches the newest acked records and the
+// checker reports them as :unseen. Those records are durable. Nobody read them.
+// The quiesce window does not hide a record that the last crash really lost. It
+// is what gives the reader time to see one. A zero until makes the loop crash
+// yasdb for the whole run. That is the behaviour when YASDB_CHAOS_WINDOW_MS is
+// unset.
+func chaosLoop(interval time.Duration, until time.Time) {
 	for {
 		time.Sleep(interval + time.Duration(nextID.Load()%1000)*time.Millisecond)
+		if !until.IsZero() && time.Now().After(until) {
+			fmt.Fprintln(os.Stderr, "chaos: window closed, yasdb stays up for the rest of the run")
+			return
+		}
 		childMu.Lock()
 		c := child
 		childMu.Unlock()
 		fmt.Fprintln(os.Stderr, "chaos: SIGKILL yasdb")
-		_ = c.Process.Kill() // hard crash — no graceful shutdown
+		killed := time.Now()
+		_ = c.Process.Kill() // SIGKILL, because a graceful shutdown would flush
 		_ = c.Wait()
-		time.Sleep(300 * time.Millisecond) // brief downtime
+		time.Sleep(300 * time.Millisecond)
 		startYasdb()
-		waitHealth(30 * time.Second) // recovery (WAL replay)
-		fmt.Fprintln(os.Stderr, "chaos: yasdb recovered")
+		waitHealth(30 * time.Second) // yasdb replays its WAL before it reports healthy
+		fmt.Fprintf(os.Stderr, "chaos: yasdb recovered in %v\n", time.Since(killed).Round(time.Millisecond))
 	}
 }
 
@@ -163,10 +187,8 @@ type reqBody struct {
 }
 
 func main() {
-	// Fault-injection mode: when YASDB_BIN is set, supervise yasdb as a child so
-	// Maelstrom's :kill / :pause nemesis crashes/pauses the actual server (not
-	// just this bridge), exercising crash recovery + durability. The child dies
-	// with us via PDEATHSIG, and on restart recovers from its persistent store.
+	// run-nemesis.sh sets YASDB_BIN to hand the adapter yasdb's lifecycle. Unset,
+	// the adapter only talks to a server someone else started.
 	if bin := os.Getenv("YASDB_BIN"); bin != "" {
 		superviseYasdb(bin)
 	}
@@ -241,7 +263,6 @@ func doSend(key string, msg json.RawMessage) (int64, error) {
 		return 0, err
 	}
 	if status == http.StatusNotFound {
-		// create the JSON stream, then retry the append
 		if err := putStream(streamURL); err != nil {
 			return 0, err
 		}
@@ -253,8 +274,8 @@ func doSend(key string, msg json.RawMessage) (int64, error) {
 	if status != http.StatusNoContent && status != http.StatusOK {
 		return 0, fmt.Errorf("append status %d", status)
 	}
-	// Stream-Next-Offset is the tail AFTER this append; the message sits at
-	// tail-1 (one JSON message per send).
+	// Stream-Next-Offset is the tail after this append. One send is one JSON
+	// message, so this message sits at tail-1.
 	return int64(nextOff) - 1, nil
 }
 
@@ -271,8 +292,9 @@ func doPoll(offsets map[string]int64) (map[string][][2]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		// 404: stream not created yet. 204: caught up (long-poll timed out with no
-		// new data). Both mean "no messages for this key right now."
+		// A 404 means the stream does not exist yet. A 204 means the poll is caught
+		// up, so a long-poll timed out with no new data. Both mean there is nothing
+		// to read for this key right now.
 		if status == http.StatusNotFound || status == http.StatusNoContent {
 			continue
 		}
@@ -293,8 +315,6 @@ func doPoll(offsets map[string]int64) (map[string][][2]any, error) {
 	}
 	return out, nil
 }
-
-// --- yasdb HTTP helpers ---
 
 func putStream(streamURL string) error {
 	req, _ := http.NewRequest("PUT", streamURL, nil)
@@ -347,8 +367,6 @@ func parseOffset(tok string) (uint64, error) {
 	return strconv.ParseUint(tok[:i], 10, 64)
 }
 
-// --- Maelstrom reply plumbing ---
-
 func reply(in message, body map[string]any, inReplyTo int64) {
 	body["in_reply_to"] = inReplyTo
 	body["msg_id"] = nextID.Add(1)
@@ -356,7 +374,7 @@ func reply(in message, body map[string]any, inReplyTo int64) {
 }
 
 func replyErr(in message, inReplyTo int64, err error) {
-	// code 13 = crash (temporary) in the Maelstrom error taxonomy.
+	// 13 is Maelstrom's "crash (temporary)" error code.
 	reply(in, map[string]any{"type": "error", "code": 13, "text": err.Error()}, inReplyTo)
 }
 
