@@ -45,7 +45,7 @@ func main() {
 	dbPath := flag.String("db", "yasdb", "database path/prefix within the object store")
 	flush := flag.Duration("flush", 10*time.Millisecond, "SlateDB WAL flush interval (durable-append latency floor); 0 = engine default (100ms)")
 	durability := flag.String("durability", "notifier", "append durability model. notifier: non-blocking write plus a durable-seq watcher; pipelines appends; scales with concurrent writers (default). sync: blocks each write on durability; lower latency for a single low-concurrency writer, and what crash-recovery testing uses.")
-	pollInterval := flag.Duration("notifier-poll", time.Millisecond, "durable-seq poll interval in -durability notifier mode")
+	pollInterval := flag.Duration("notifier-poll", time.Millisecond, "durable-seq poll interval in -durability notifier mode, for store backends that cannot push durability updates (-store pwal://, or an embedder's own Storage). Ignored by the SlateDB backend, which subscribes.")
 	longPollTimeout := flag.Duration("longpoll-timeout", 0, "how long a live=long-poll read blocks waiting for data before it returns 204; 0 = default (25s)")
 	metricsAddr := flag.String("metrics-addr", "", "listen address for a Prometheus /metrics endpoint that exposes native SlateDB engine metrics; empty = disabled. Serve this on a separate, non-public address (e.g. Fly's private-network-only metrics port, conventionally :9091), not on -addr.")
 	slatedbLogLevel := flag.String("slatedb-log-level", "warn", "SlateDB native (Rust-side) log level written to stderr: off|error|warn|info|debug|trace. Use debug or trace to diagnose stalls; both are verbose (per-flush/compaction detail) and noisy for steady-state production.")
@@ -57,8 +57,19 @@ func main() {
 	pprofMutexFraction := flag.Int("pprof-mutex-fraction", 0, "runtime.SetMutexProfileFraction (1 = sample every mutex contention event); 0 = off. See -pprof-block-rate.")
 	adminBulkProvision := flag.Bool("admin-bulk-provision", false, "mount POST /__admin/bulk-provision on -metrics-addr (private-network-only). Creates many empty streams in a few batched Commit calls, instead of one HTTP request per stream, for fast load-test setup. Off by default: it is a mutating, storage-filling operation.")
 	committerBatchMax := flag.Int("committer-batch-max", 0, "max number of different streams' bursts one commit folds into a single WriteBatch, in -durability notifier mode (see docs/rfcs/0001-cross-stream-group-commit.md); 0 = engine default (512)")
+	authToken := flag.String("auth-token", "", "shared secret that every request to -addr must present as an Authorization: Bearer header, and that POST /__admin/bulk-provision requires too. Empty = no authentication, and anyone who can reach -addr can read, write, and delete any stream. Prefer the YASDB_AUTH_TOKEN environment variable, which this flag overrides, because a flag value is readable by every process on the machine. GET /__health and CORS preflight (OPTIONS) stay open either way.")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	// The environment variable is the preferred source. A flag value shows
+	// up in the process list (ps, /proc/<pid>/cmdline) for every local
+	// user, so docker-entrypoint.sh passes the secret through the
+	// environment instead of building a -auth-token argument. The flag
+	// still wins when both are set, for a one-off local run.
+	token := os.Getenv("YASDB_AUTH_TOKEN")
+	if *authToken != "" {
+		token = *authToken
+	}
 
 	if *showVersion {
 		fmt.Printf("yasdb %s (commit %s, built %s)\n", version, commit, date)
@@ -117,7 +128,13 @@ func main() {
 
 	// httpapi.NewHandler adapts db to the full Durable Streams wire
 	// protocol plus /__health and /__state; see yasdb/httpapi.
-	httpSrv := &http.Server{Addr: *addr, Handler: httpapi.NewHandler(db)}
+	httpSrv := &http.Server{Addr: *addr, Handler: httpapi.RequireBearerToken(token, httpapi.NewHandler(db))}
+
+	if token == "" {
+		log.Printf("WARNING: authentication is disabled. Anyone who can reach %s can read, write, and delete any stream. Set YASDB_AUTH_TOKEN to require a bearer token.", *addr)
+	} else {
+		log.Printf("authentication enabled on %s: requests need an Authorization: Bearer header. GET /__health and OPTIONS preflight stay open.", *addr)
+	}
 
 	go func() {
 		log.Printf("yasdb %s listening on %s (store=%s, durability=%s)", version, *addr, url, *durability)
@@ -164,7 +181,12 @@ func main() {
 			log.Printf("pprof enabled on %s/debug/pprof/ (block-rate=%d mutex-fraction=%d) — private-network-only, investigative use", *metricsAddr, *pprofBlockRate, *pprofMutexFraction)
 		}
 		if *adminBulkProvision {
-			mux.HandleFunc("/__admin/bulk-provision", srv.HandleBulkProvision)
+			// Defence in depth. This listener is private-network-only and
+			// the endpoint is already off by default, but it is the one
+			// mutating route on this mux, so it takes the same token when
+			// one is set. /metrics and pprof stay open, because Fly
+			// scrapes /metrics over 6PN and cannot send a bearer header.
+			mux.Handle("/__admin/bulk-provision", httpapi.RequireBearerToken(token, http.HandlerFunc(srv.HandleBulkProvision)))
 			log.Printf("bulk-provision enabled on %s/__admin/bulk-provision — private-network-only, load-test use", *metricsAddr)
 		}
 		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: mux}

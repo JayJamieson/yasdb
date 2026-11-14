@@ -48,8 +48,21 @@ Entrypoint env contract (`docker-entrypoint.sh`):
 | `YASDB_DB` | DB path/prefix within the store (object-store mode) | `yasdb` |
 | `YASDB_DATA` | data dir (local-volume mode) | `/data/yasdb` |
 | `YASDB_FLUSH` | WAL flush interval / durable-append latency floor | `10ms` |
+| `YASDB_AUTH_TOKEN` | shared secret every request must send as `Authorization: Bearer <token>`; empty means: no authentication | *(empty)* |
 | `PORT` | listen port | `4437` |
 | `AWS_*` | S3/Tigris credentials + endpoint (object-store mode) | — |
+
+Set the token with `fly secrets set YASDB_AUTH_TOKEN=$(openssl rand -hex 32)`,
+not in `fly.toml`'s `[env]` block, which is committed in the clear. The
+entrypoint passes it through the environment and never builds a
+`-auth-token` argument, because `ps` and `/proc/<pid>/cmdline` expose one
+process's arguments to every local user.
+
+`GET /__health` stays open with a token set, so the `[http_service]` check
+in `fly.toml` keeps passing. `OPTIONS` stays open for browser preflights,
+and `/metrics` on the private listener stays open for Fly's scraper. See
+the README's [Authentication](../README.md#authentication) section for the
+full list.
 
 ---
 

@@ -16,6 +16,10 @@ import (
 // the same way /__health is.
 const stateSnapshotPrefix = "/__state"
 
+// healthPath is the liveness/readiness endpoint. RequireBearerToken exempts
+// it, so the route and the exemption have to agree on one spelling.
+const healthPath = "/__health"
+
 // NewHandler adapts db to the full Durable Streams HTTP surface: the wire
 // protocol (create/append/read/tail/fork/delete, ds.Server.ServeHTTP)
 // plus two convenience endpoints outside the stream keyspace —
@@ -33,7 +37,7 @@ func NewHandler(db *yasdb.DB) http.Handler {
 	srv := db.Server()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/__health":
+		case r.URL.Path == healthPath:
 			serveHealth(w, r)
 		case r.URL.Path == stateSnapshotPrefix || strings.HasPrefix(r.URL.Path, stateSnapshotPrefix+"/"):
 			serveStateSnapshot(db, w, r)

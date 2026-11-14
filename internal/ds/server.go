@@ -82,7 +82,7 @@ type Config struct {
 	//                   appends pipeline instead of blocking on the flush.
 	// Both modes acknowledge Stream-Next-Offset only once the data is durable.
 	Durability           string
-	NotifierPollInterval time.Duration // durable-seq poll interval (notifier mode)
+	NotifierPollInterval time.Duration // durable-seq poll interval, for a backend that is not a DurabilitySubscriber
 
 	// CommitterBatchMax bounds how many different streams' bursts one
 	// physical CommitAsync call folds together (notifier mode only — see

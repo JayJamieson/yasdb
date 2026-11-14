@@ -8,6 +8,13 @@ ADDR=":${PORT:-4437}"
 FLUSH="${YASDB_FLUSH:-10ms}"
 DURABILITY="${YASDB_DURABILITY:-notifier}"
 
+# YASDB_AUTH_TOKEN is deliberately absent from the exec lines below. yasdb
+# reads it from the environment itself (see main.go), which `exec` passes
+# through. Do not turn it into a -auth-token argument: every local user can
+# read another process's arguments from `ps` and /proc/<pid>/cmdline, so a
+# flag would publish the secret on the machine. Set it with
+# `fly secrets set YASDB_AUTH_TOKEN=...`, not in fly.toml's [env].
+
 # Optional: a Prometheus /metrics endpoint of native SlateDB engine
 # metrics, on its own address (see fly.toml's [metrics] block; Fly scrapes
 # this over the private network, not the public one -addr serves).

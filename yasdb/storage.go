@@ -22,6 +22,48 @@ type Iterator = ds.Iterator
 // every backend has metrics to report.
 type MetricsProvider = ds.MetricsProvider
 
+// DurabilitySubscriber is implemented by Storage backends that can block
+// until their durable watermark advances (OpenStore's SlateDB backend does,
+// via its status subscription). In notifier durability mode a Storage that
+// implements this is pushed to rather than polled every
+// Config.NotifierPollInterval. Implementing it is optional: a backend
+// without it keeps the poll.
+//
+// The interface has one method:
+//
+//	WatchDurable(after uint64, stop <-chan struct{}) (durable uint64, err error)
+//
+// An implementation must hold all of the following.
+//
+//   - It blocks until the backend's durable watermark exceeds after, then
+//     returns that watermark.
+//   - It may instead return early with a watermark at or below after,
+//     meaning "nothing new yet". yasdb loops.
+//   - The watermark it returns is always one the backend observed as
+//     durable, never after itself and never a floor the caller already knew.
+//     yasdb carries the value forward as the baseline it acknowledges
+//     against, so a watermark the backend never reached would acknowledge a
+//     write that is not durable.
+//   - It returns promptly once stop is closed. DB.Close joins the watcher
+//     goroutine before it calls Storage.Close, and it has no other way to
+//     interrupt a call already in flight, so a WatchDurable that waits on a
+//     condition and ignores stop hangs DB.Close for as long as that
+//     condition takes. Returning the current watermark with a nil error is
+//     enough. A call that cannot watch stop, such as one parked in a C
+//     library, must bound itself with its own timeout instead.
+//   - A non-nil error means the backend is closed or has failed. yasdb then
+//     fails every outstanding acknowledgement and stops watching, and the
+//     returned watermark is ignored.
+//
+// yasdb calls WatchDurable from one goroutine only, and that is the same
+// goroutine it runs durability callbacks on, so an implementation need not be
+// safe for concurrent use.
+//
+// A decorator that embeds the Storage interface does not inherit this and
+// falls back to the poll. That is correct, just slower. Forward WatchDurable
+// explicitly to keep the push path.
+type DurabilitySubscriber = ds.DurabilitySubscriber
+
 // StoreTuning holds the SlateDB engine knobs OpenStore exposes. Zero
 // values mean "use the SlateDB default" for every field.
 type StoreTuning = ds.StoreTuning

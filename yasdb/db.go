@@ -47,7 +47,13 @@ type Config struct {
 	// each group-commit on a durable write; "notifier" writes non-durably
 	// and acknowledges via a durable-seq watcher, pipelining appends. Both
 	// acknowledge only once the data is durable.
-	Durability           string
+	Durability string
+
+	// NotifierPollInterval is how often "notifier" mode polls Storage for
+	// the durable watermark. It applies only to a backend that cannot push
+	// durability updates, meaning one that does not implement
+	// DurabilitySubscriber. OpenStore's SlateDB backend does implement it
+	// and is never polled, so this is inert for it. 0 = 1ms.
 	NotifierPollInterval time.Duration
 
 	// CommitterBatchMax bounds how many different streams' bursts one
